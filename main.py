@@ -55,6 +55,12 @@ cv2.resizeWindow("HiddenWindow", 1, 1)
 last_boxes = []
 last_infer_time = 0
 
+# スムージング用のバッファ
+# {id: {"history": [(cx, cy, face_size), ...], "last_update": time}}
+face_history = {}
+SMOOTH_FRAMES = 5
+DISTANCE_THRESHOLD = 50  # 前フレームとの距離のしきい値
+
 with pyvirtualcam.Camera(width=width, height=height, fps=fps, fmt=PixelFormat.BGR) as cam:
     print(f'✅ Virtual camera started: {cam.device}')
     print("🎭 Mキーでマスク切替、Qキーで終了")
@@ -77,22 +83,63 @@ with pyvirtualcam.Camera(width=width, height=height, fps=fps, fmt=PixelFormat.BG
         # 一定間隔ごとに推論
         if now - last_infer_time > infer_interval:
             results = model.predict(frame, verbose=False)[0]
-            last_boxes = [box.cpu().numpy() for box in results.boxes.xyxy]
+            current_faces = []
+            for box in results.boxes.xyxy:
+                x1, y1, x2, y2 = map(int, box[:4])
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                face_size = int(max(x2 - x1, y2 - y1) * scale)
+                current_faces.append((cx, cy, face_size))
+            
+            # --- スムージング処理 ---
+            new_face_history = {}
+            for (cx, cy, fs) in current_faces:
+                # 既存の顔と紐付け（距離が近いものを探す）
+                matched_id = None
+                min_dist = DISTANCE_THRESHOLD
+                for fid, data in face_history.items():
+                    prev_cx, prev_cy, _ = data["history"][-1]
+                    dist = np.sqrt((cx - prev_cx)**2 + (cy - prev_cy)**2)
+                    if dist < min_dist:
+                        min_dist = dist
+                        matched_id = fid
+                
+                if matched_id is not None:
+                    # 履歴を更新
+                    history = face_history[matched_id]["history"]
+                    history.append((cx, cy, fs))
+                    if len(history) > SMOOTH_FRAMES:
+                        history.pop(0)
+                    new_face_history[matched_id] = {"history": history, "last_update": now}
+                else:
+                    # 新しい顔として登録
+                    new_id = time.time() + np.random.rand()
+                    new_face_history[new_id] = {"history": [(cx, cy, fs)], "last_update": now}
+            
+            # 古いデータを削除（一定時間更新がないもの）
+            for fid, data in face_history.items():
+                if now - data["last_update"] < 0.5 and fid not in new_face_history:
+                     # 推論しなかっただけで、まだ存在している可能性が高い場合は前回の履歴を維持
+                     new_face_history[fid] = data
+
+            face_history = new_face_history
             last_infer_time = now
 
-        # 前回 or 最新の検出結果でマスク合成
+        # マスク合成（スムージングされたデータを使用）
         if mask_enabled:
-            for box in last_boxes:
-                x1, y1, x2, y2 = map(int, box[:4])
-                cx = (x1 + x2) // 2
-                cy = (y1 + y2) // 2
-                face_w = x2 - x1
-                face_h = y2 - y1
-                face_size = int(max(face_w, face_h) * scale)
-                resized = cv2.resize(overlay_img, (face_size, face_size))
-                x_offset = cx - face_size // 2
-                y_offset = cy - face_size // 2
-                frame = overlay_transparent(frame, resized, x_offset, y_offset)
+            for fid, data in face_history.items():
+                # 平均値を計算
+                history = data["history"]
+                avg_cx = int(np.mean([h[0] for h in history]))
+                avg_cy = int(np.mean([h[1] for h in history]))
+                avg_fs = int(np.mean([h[2] for h in history]))
+
+                try:
+                    resized = cv2.resize(overlay_img, (avg_fs, avg_fs))
+                    x_offset = avg_cx - avg_fs // 2
+                    y_offset = avg_cy - avg_fs // 2
+                    frame = overlay_transparent(frame, resized, x_offset, y_offset)
+                except cv2.error:
+                    continue
 
         cam.send(frame)
         cam.sleep_until_next_frame()

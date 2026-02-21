@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+build/
+dist/
+*.spec
+
+# MediaPipe
+mediapipe-env/
+
+# Data
+yolov8-face/
+*.pt
+
+# OS
+.DS_Store
+Thumbs.db

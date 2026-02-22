@@ -10,6 +10,7 @@ import time
 import torch
 import threading
 import customtkinter as ctk
+import os
 
 # --- 設定（初期値） ---
 class AppConfig:
@@ -20,8 +21,23 @@ class AppConfig:
     smooth_frames = 5
     distance_threshold = 50
     running = True
+    current_mask_name = "mask.png"
+    mask_files = []
 
 config = AppConfig()
+
+# --- フォルダ準備 ---
+MASK_DIR = "masks"
+if not os.path.exists(MASK_DIR):
+    os.makedirs(MASK_DIR)
+
+def get_mask_list():
+    files = [f for f in os.listdir(MASK_DIR) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    return files if files else ["mask.png"]
+
+config.mask_files = get_mask_list()
+if config.mask_files:
+    config.current_mask_name = config.mask_files[0]
 
 # --- アルファ合成 ---
 def overlay_transparent(background, overlay, x, y):
@@ -50,7 +66,10 @@ def camera_thread():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.height)
 
-    overlay_img = cv2.imread("mask.png", cv2.IMREAD_UNCHANGED)
+    current_mask_path = os.path.join(MASK_DIR, config.current_mask_name)
+    overlay_img = cv2.imread(current_mask_path, cv2.IMREAD_UNCHANGED)
+    loaded_mask_name = config.current_mask_name
+
     model = YOLO("yolov8n-face.pt")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
@@ -63,6 +82,15 @@ def camera_thread():
         print(f'✅ Virtual camera started: {cam.device}')
 
         while config.running:
+            # マスクの切り替え判定
+            if loaded_mask_name != config.current_mask_name:
+                mask_path = os.path.join(MASK_DIR, config.current_mask_name)
+                if os.path.exists(mask_path):
+                    new_img = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+                    if new_img is not None:
+                        overlay_img = new_img
+                        loaded_mask_name = config.current_mask_name
+
             ret, frame = cap.read()
             if not ret:
                 break
@@ -91,7 +119,7 @@ def camera_thread():
                     if matched_id is not None:
                         history = face_history[matched_id]["history"]
                         history.append((cx, cy, fs))
-                        if len(history) > 20: # 最大履歴長
+                        if len(history) > 20: 
                             history.pop(0)
                         new_face_history[matched_id] = {"history": history, "last_update": now}
                     else:
@@ -105,7 +133,7 @@ def camera_thread():
                 face_history = new_face_history
                 last_infer_time = now
 
-            if config.mask_enabled:
+            if config.mask_enabled and overlay_img is not None:
                 for fid, data in face_history.items():
                     history = data["history"]
                     current_history = history[-config.smooth_frames:]
@@ -132,13 +160,20 @@ class ControlApp(ctk.CTk):
         super().__init__()
 
         self.title("OBS Mask Cam - コントロールパネル")
-        self.geometry("450x400")
+        self.geometry("450x500")
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
         # タイトル
         self.label_title = ctk.CTkLabel(self, text="🎭 OBS Mask Cam 設定", font=ctk.CTkFont(size=20, weight="bold"))
         self.label_title.pack(pady=20)
+
+        # マスク選択プルダウン
+        self.label_mask_choice = ctk.CTkLabel(self, text="使用するマスク:")
+        self.label_mask_choice.pack(pady=(10, 0))
+        self.option_mask = ctk.CTkOptionMenu(self, values=config.mask_files, command=self.update_mask_choice)
+        self.option_mask.set(config.current_mask_name)
+        self.option_mask.pack(pady=5)
 
         # マスク有効/無効トグル
         self.switch_mask = ctk.CTkSwitch(self, text="マスクを有効にする", command=self.toggle_mask)
@@ -171,6 +206,10 @@ class ControlApp(ctk.CTk):
         self.btn_quit.pack(pady=30)
 
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def update_mask_choice(self, choice):
+        config.current_mask_name = choice
+        print(f"🎭 マスク切り替え: {choice}")
 
     def toggle_mask(self):
         config.mask_enabled = self.switch_mask.get() == 1

@@ -275,16 +275,30 @@ class ControlApp(ctk.CTk):
     def add_mask_file(self):
         file_path = filedialog.askopenfilename(filetypes=[("Image files", "*.png *.jpg *.jpeg")])
         if file_path:
-            file_name = os.path.basename(file_path)
-            dest_path = os.path.join(MASK_DIR, file_name)
             try:
-                shutil.copy(file_path, dest_path)
+                # 画像を読み込んでチャンネル数を確認
+                img = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
+                if img is None: return
+
+                if len(img.shape) == 2: # グレースケール
+                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
+                elif img.shape[2] == 3: # BGR
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+                
+                # ファイル名を強制的に .png に変更して保存
+                base_name = os.path.splitext(os.path.basename(file_path))[0]
+                new_file_name = f"{base_name}.png"
+                dest_path = os.path.join(MASK_DIR, new_file_name)
+                
+                cv2.imwrite(dest_path, img)
+                print(f"✅ 画像を透過対応PNGとして保存しました: {new_file_name}")
+
                 config.need_reload_list = True
                 time.sleep(0.1)
                 new_list = get_mask_list()
                 self.option_mask.configure(values=new_list)
-                self.option_mask.set(file_name)
-                self.update_mask_choice(file_name)
+                self.option_mask.set(new_file_name)
+                self.update_mask_choice(new_file_name)
             except Exception as e:
                 print(f"Error adding file: {e}")
 

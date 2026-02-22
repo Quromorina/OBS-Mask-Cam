@@ -27,8 +27,22 @@ class AppConfig:
     current_mask_name = "mask.png"
     mask_files = []
     need_reload_list = False
+    camera_index = 0
+    camera_list = []
 
 config = AppConfig()
+
+# --- カメラ検出 ---
+def get_camera_list(max_to_test=10):
+    available = []
+    for i in range(max_to_test):
+        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
+        if cap.isOpened():
+            available.append(str(i))
+            cap.release()
+    return available if available else ["0"]
+
+config.camera_list = get_camera_list()
 
 # --- フォルダ準備 ---
 MASK_DIR = "masks"
@@ -36,7 +50,7 @@ if not os.path.exists(MASK_DIR):
     os.makedirs(MASK_DIR)
 
 def get_mask_list():
-    files = [f for f in os.listdir(MASK_DIR) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    files = [f for f in os.listdir(MASK_DIR) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp'))]
     return files if files else ["mask.png"]
 
 config.mask_files = get_mask_list()
@@ -77,15 +91,20 @@ def overlay_transparent(background, overlay, x, y):
 
 # --- カメラ・AI処理スレッド ---
 def camera_thread():
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(config.camera_index, cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.height)
+    last_camera_index = config.camera_index
 
     def load_mask(name):
         path = os.path.join(MASK_DIR, name)
         img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-        if img is not None and img.shape[2] == 3:
-            # JPG等の透過なし画像は不透明なアルファを追加してBGRAに変換
+        if img is None:
+            return None
+        
+        if len(img.shape) == 2: # グレースケール
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
+        elif img.shape[2] == 3: # BGR
             img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
         return img
 
@@ -104,6 +123,15 @@ def camera_thread():
         print(f'✅ Virtual camera started: {cam.device}')
 
         while config.running:
+            # カメラソースの切り替えチェック
+            if last_camera_index != config.camera_index:
+                print(f"🔄 カメラ切り替え中: Index {config.camera_index}")
+                cap.release()
+                cap = cv2.VideoCapture(config.camera_index, cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.height)
+                last_camera_index = config.camera_index
+
             # マスクリストの更新チェック
             if config.need_reload_list:
                 config.mask_files = get_mask_list()
@@ -186,7 +214,7 @@ class ControlApp(ctk.CTk):
         super().__init__()
 
         self.title("OBS Mask Cam - コントロールパネル")
-        self.geometry("450x700")
+        self.geometry("450x800")
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
@@ -199,6 +227,18 @@ class ControlApp(ctk.CTk):
         # タイトル
         self.label_title = ctk.CTkLabel(self, text="🎭 OBS Mask Cam", font=self.font_title)
         self.label_title.pack(pady=15)
+
+        # --- カメラ選択エリア ---
+        self.camera_frame = ctk.CTkFrame(self)
+        self.camera_frame.pack(pady=10, padx=20, fill="x")
+        
+        self.label_camera = ctk.CTkLabel(self.camera_frame, text="映像ソース (カメラ):", font=self.font_bold)
+        self.label_camera.pack(side="left", padx=10, pady=10)
+        
+        self.option_camera = ctk.CTkOptionMenu(self.camera_frame, values=[f"Camera {c}" for c in config.camera_list], 
+                                               font=self.font_main, command=self.update_camera_choice)
+        self.option_camera.set(f"Camera {config.camera_index}")
+        self.option_camera.pack(side="right", padx=10, pady=10)
 
         # --- プレビューエリア ---
         self.preview_frame = ctk.CTkFrame(self, width=200, height=200)
@@ -273,7 +313,7 @@ class ControlApp(ctk.CTk):
             print(f"Preview error: {e}")
 
     def add_mask_file(self):
-        file_path = filedialog.askopenfilename(filetypes=[("Image files", "*.png *.jpg *.jpeg")])
+        file_path = filedialog.askopenfilename(filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.webp")])
         if file_path:
             try:
                 # 画像を読み込んでチャンネル数を確認
@@ -306,6 +346,10 @@ class ControlApp(ctk.CTk):
         config.current_mask_name = choice
         self.update_preview()
         print(f"🎭 マスク切り替え: {choice}")
+
+    def update_camera_choice(self, choice):
+        index = int(choice.split(" ")[-1])
+        config.camera_index = index
 
     def toggle_mask(self):
         config.mask_enabled = not config.mask_enabled

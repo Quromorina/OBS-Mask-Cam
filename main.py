@@ -55,13 +55,14 @@ def overlay_transparent(background, overlay, x, y):
 
 # コントロールパネルの作成
 win_name = "Control Panel"
-cv2.namedWindow(win_name)
+# WINDOW_NORMAL にすることでマウスでのリサイズを可能にする
+cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
 cv2.resizeWindow(win_name, 400, 300)
 
-# トラックバーの作成（整数値で管理するためスケーリングが必要なものは調整）
-cv2.createTrackbar("Scale x10", win_name, int(scale * 10), 40, nothing)    # 1.0 〜 4.0
-cv2.createTrackbar("Smooth (Frames)", win_name, smooth_frames, 20, nothing) # 1 〜 20
-cv2.createTrackbar("Infer Int (ms)", win_name, int(infer_interval * 1000), 500, nothing) # 0 〜 500 ms
+# トラックバーの作成（日本語は文字化けの可能性があるため、分かりやすいローマ字/日本語を併記）
+cv2.createTrackbar("Mask Size (x10)", win_name, int(scale * 10), 40, nothing)    # マスクの大きさ
+cv2.createTrackbar("Smooth (Frames)", win_name, smooth_frames, 20, nothing)     # スムージング強度
+cv2.createTrackbar("Infer Interval(ms)", win_name, int(infer_interval * 1000), 500, nothing) # 推論間隔
 
 # 推論保持
 last_boxes = []
@@ -82,13 +83,14 @@ with pyvirtualcam.Camera(width=width, height=height, fps=fps, fmt=PixelFormat.BG
             break
 
         # トラックバーの値を取得して反映
-        scale = cv2.getTrackbarPos("Scale x10", win_name) / 10.0
+        scale = cv2.getTrackbarPos("Mask Size (x10)", win_name) / 10.0
         smooth_frames = max(1, cv2.getTrackbarPos("Smooth (Frames)", win_name))
-        infer_interval = cv2.getTrackbarPos("Infer Int (ms)", win_name) / 1000.0
+        infer_interval = cv2.getTrackbarPos("Infer Interval(ms)", win_name) / 1000.0
 
-        # 操作用の黒背景画像を表示（ここに情報を表示することも可能）
-        panel_img = np.zeros((100, 400, 3), dtype=np.uint8)
-        cv2.putText(panel_img, "M: Toggle Mask, Q: Quit", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
+        # 操作用の黒背景画像を表示
+        panel_img = np.zeros((150, 500, 3), dtype=np.uint8)
+        cv2.putText(panel_img, "M: Mask ON/OFF", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
+        cv2.putText(panel_img, "Q: Quit", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
         cv2.imshow(win_name, panel_img)
 
         key = cv2.waitKey(1) & 0xFF

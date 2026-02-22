@@ -9,11 +9,17 @@ from ultralytics import YOLO
 import time
 import torch
 
-# 設定
+# 設定（初期値）
 width, height, fps = 1280, 720, 30
 scale = 1.8
 mask_enabled = True
-infer_interval = 0.02  # 秒（推論頻度：0.5なら2回/秒、1.0なら1回/秒）
+infer_interval = 0.02  # 秒
+smooth_frames = 5
+distance_threshold = 50
+
+# トラックバー用コールバック（空）
+def nothing(x):
+    pass
 
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
@@ -47,9 +53,15 @@ def overlay_transparent(background, overlay, x, y):
     background[y1:y2, x1:x2] = cv2.add(img1_bg, img2_fg)
     return background
 
-# ダミーウィンドウ（キー入力用）
-cv2.namedWindow("HiddenWindow", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("HiddenWindow", 1, 1)
+# コントロールパネルの作成
+win_name = "Control Panel"
+cv2.namedWindow(win_name)
+cv2.resizeWindow(win_name, 400, 300)
+
+# トラックバーの作成（整数値で管理するためスケーリングが必要なものは調整）
+cv2.createTrackbar("Scale x10", win_name, int(scale * 10), 40, nothing)    # 1.0 〜 4.0
+cv2.createTrackbar("Smooth (Frames)", win_name, smooth_frames, 20, nothing) # 1 〜 20
+cv2.createTrackbar("Infer Int (ms)", win_name, int(infer_interval * 1000), 500, nothing) # 0 〜 500 ms
 
 # 推論保持
 last_boxes = []
@@ -58,7 +70,6 @@ last_infer_time = 0
 # スムージング用のバッファ
 # {id: {"history": [(cx, cy, face_size), ...], "last_update": time}}
 face_history = {}
-SMOOTH_FRAMES = 5
 DISTANCE_THRESHOLD = 50  # 前フレームとの距離のしきい値
 
 with pyvirtualcam.Camera(width=width, height=height, fps=fps, fmt=PixelFormat.BGR) as cam:
@@ -70,7 +81,16 @@ with pyvirtualcam.Camera(width=width, height=height, fps=fps, fmt=PixelFormat.BG
         if not ret:
             break
 
-        cv2.imshow("HiddenWindow", np.zeros((1, 1), dtype=np.uint8))
+        # トラックバーの値を取得して反映
+        scale = cv2.getTrackbarPos("Scale x10", win_name) / 10.0
+        smooth_frames = max(1, cv2.getTrackbarPos("Smooth (Frames)", win_name))
+        infer_interval = cv2.getTrackbarPos("Infer Int (ms)", win_name) / 1000.0
+
+        # 操作用の黒背景画像を表示（ここに情報を表示することも可能）
+        panel_img = np.zeros((100, 400, 3), dtype=np.uint8)
+        cv2.putText(panel_img, "M: Toggle Mask, Q: Quit", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
+        cv2.imshow(win_name, panel_img)
+
         key = cv2.waitKey(1) & 0xFF
         if key == ord('m'):
             mask_enabled = not mask_enabled
@@ -107,7 +127,7 @@ with pyvirtualcam.Camera(width=width, height=height, fps=fps, fmt=PixelFormat.BG
                     # 履歴を更新
                     history = face_history[matched_id]["history"]
                     history.append((cx, cy, fs))
-                    if len(history) > SMOOTH_FRAMES:
+                    if len(history) > smooth_frames:
                         history.pop(0)
                     new_face_history[matched_id] = {"history": history, "last_update": now}
                 else:
@@ -129,9 +149,11 @@ with pyvirtualcam.Camera(width=width, height=height, fps=fps, fmt=PixelFormat.BG
             for fid, data in face_history.items():
                 # 平均値を計算
                 history = data["history"]
-                avg_cx = int(np.mean([h[0] for h in history]))
-                avg_cy = int(np.mean([h[1] for h in history]))
-                avg_fs = int(np.mean([h[2] for h in history]))
+                # 直近のsmooth_frames数分のみを使用
+                current_history = history[-smooth_frames:]
+                avg_cx = int(np.mean([h[0] for h in current_history]))
+                avg_cy = int(np.mean([h[1] for h in current_history]))
+                avg_fs = int(np.mean([h[2] for h in current_history]))
 
                 try:
                     resized = cv2.resize(overlay_img, (avg_fs, avg_fs))

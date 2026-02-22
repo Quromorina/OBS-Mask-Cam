@@ -11,6 +11,9 @@ import torch
 import threading
 import customtkinter as ctk
 import os
+import shutil
+from tkinter import filedialog
+from PIL import Image
 
 # --- 設定（初期値） ---
 class AppConfig:
@@ -23,6 +26,7 @@ class AppConfig:
     running = True
     current_mask_name = "mask.png"
     mask_files = []
+    need_reload_list = False
 
 config = AppConfig()
 
@@ -82,6 +86,11 @@ def camera_thread():
         print(f'✅ Virtual camera started: {cam.device}')
 
         while config.running:
+            # マスクリストの更新チェック
+            if config.need_reload_list:
+                config.mask_files = get_mask_list()
+                config.need_reload_list = False
+
             # マスクの切り替え判定
             if loaded_mask_name != config.current_mask_name:
                 mask_path = os.path.join(MASK_DIR, config.current_mask_name)
@@ -160,60 +169,119 @@ class ControlApp(ctk.CTk):
         super().__init__()
 
         self.title("OBS Mask Cam - コントロールパネル")
-        self.geometry("450x500")
+        self.geometry("450x700")
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
         # タイトル
-        self.label_title = ctk.CTkLabel(self, text="🎭 OBS Mask Cam 設定", font=ctk.CTkFont(size=20, weight="bold"))
-        self.label_title.pack(pady=20)
+        self.label_title = ctk.CTkLabel(self, text="🎭 OBS Mask Cam", font=ctk.CTkFont(size=24, weight="bold"))
+        self.label_title.pack(pady=15)
 
-        # マスク選択プルダウン
-        self.label_mask_choice = ctk.CTkLabel(self, text="使用するマスク:")
+        # --- プレビューエリア ---
+        self.preview_frame = ctk.CTkFrame(self, width=200, height=200)
+        self.preview_frame.pack(pady=10)
+        self.preview_label = ctk.CTkLabel(self.preview_frame, text="画像なし")
+        self.preview_label.place(relx=0.5, rely=0.5, anchor="center")
+        
+        # --- マスク選択・追加 ---
+        self.label_mask_choice = ctk.CTkLabel(self, text="使用するマスク選択:", font=ctk.CTkFont(weight="bold"))
         self.label_mask_choice.pack(pady=(10, 0))
+        
         self.option_mask = ctk.CTkOptionMenu(self, values=config.mask_files, command=self.update_mask_choice)
         self.option_mask.set(config.current_mask_name)
         self.option_mask.pack(pady=5)
 
-        # マスク有効/無効トグル
-        self.switch_mask = ctk.CTkSwitch(self, text="マスクを有効にする", command=self.toggle_mask)
-        self.switch_mask.select()
-        self.switch_mask.pack(pady=10)
+        self.btn_add_mask = ctk.CTkButton(self, text="➕ 新しいマスクを追加", fg_color="#2b719e", command=self.add_mask_file)
+        self.btn_add_mask.pack(pady=5)
+
+        # --- マスクON/OFF 大ボタン ---
+        self.btn_toggle = ctk.CTkButton(self, text="マスクを無効にする", height=60, font=ctk.CTkFont(size=18, weight="bold"),
+                                        fg_color="#2d8659", hover_color="#236b47", command=self.toggle_mask)
+        self.btn_toggle.pack(pady=20, padx=40, fill="x")
+        self.update_toggle_button_ui()
+
+        # --- 設定エリア ---
+        self.settings_frame = ctk.CTkFrame(self)
+        self.settings_frame.pack(pady=10, padx=20, fill="x")
 
         # マスクサイズ調整
-        self.label_scale = ctk.CTkLabel(self, text=f"マスクの大きさ: {config.scale:.1f}")
+        self.label_scale = ctk.CTkLabel(self.settings_frame, text=f"マスクの大きさ: {config.scale:.1f}")
         self.label_scale.pack(pady=(10, 0))
-        self.slider_scale = ctk.CTkSlider(self, from_=1.0, to=4.0, command=self.update_scale)
+        self.slider_scale = ctk.CTkSlider(self.settings_frame, from_=1.0, to=4.0, command=self.update_scale)
         self.slider_scale.set(config.scale)
-        self.slider_scale.pack(padx=20, fill="x")
+        self.slider_scale.pack(padx=20, pady=(0, 10), fill="x")
 
         # スムージング調整
-        self.label_smooth = ctk.CTkLabel(self, text=f"動きの滑らかさ (フレーム): {config.smooth_frames}")
+        self.label_smooth = ctk.CTkLabel(self.settings_frame, text=f"動きの滑らかさ: {config.smooth_frames}")
         self.label_smooth.pack(pady=(10, 0))
-        self.slider_smooth = ctk.CTkSlider(self, from_=1, to=20, number_of_steps=19, command=self.update_smooth)
+        self.slider_smooth = ctk.CTkSlider(self.settings_frame, from_=1, to=20, number_of_steps=19, command=self.update_smooth)
         self.slider_smooth.set(config.smooth_frames)
-        self.slider_smooth.pack(padx=20, fill="x")
+        self.slider_smooth.pack(padx=20, pady=(0, 10), fill="x")
 
         # 推論間隔調整
-        self.label_infer = ctk.CTkLabel(self, text=f"認識の頻度 (ミリ秒): {int(config.infer_interval * 1000)}")
+        self.label_infer = ctk.CTkLabel(self.settings_frame, text=f"認識の頻度: {int(config.infer_interval * 1000)}ms")
         self.label_infer.pack(pady=(10, 0))
-        self.slider_infer = ctk.CTkSlider(self, from_=0, to=500, command=self.update_infer)
+        self.slider_infer = ctk.CTkSlider(self.settings_frame, from_=1, to=500, command=self.update_infer)
         self.slider_infer.set(config.infer_interval * 1000)
-        self.slider_infer.pack(padx=20, fill="x")
+        self.slider_infer.pack(padx=20, pady=(0, 20), fill="x")
 
         # 終了ボタン
-        self.btn_quit = ctk.CTkButton(self, text="アプリを終了", fg_color="red", hover_color="darkred", command=self.on_closing)
-        self.btn_quit.pack(pady=30)
+        self.btn_quit = ctk.CTkButton(self, text="アプリを終了", height=40, fg_color="#9e2b2b", hover_color="#7a2222", command=self.on_closing)
+        self.btn_quit.pack(pady=(20, 30))
 
+        self.update_preview()
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def update_preview(self):
+        try:
+            path = os.path.join(MASK_DIR, config.current_mask_name)
+            if os.path.exists(path):
+                img = Image.open(path)
+                # アスペクト比を維持してリサイズ
+                aspect = img.width / img.height
+                if aspect > 1:
+                    w, h = 180, int(180 / aspect)
+                else:
+                    w, h = int(180 * aspect), 180
+                
+                ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(w, h))
+                self.preview_label.configure(image=ctk_img, text="")
+        except Exception as e:
+            self.preview_label.configure(image=None, text="エラー")
+            print(f"Preview error: {e}")
+
+    def add_mask_file(self):
+        file_path = filedialog.askopenfilename(filetypes=[("Image files", "*.png *.jpg *.jpeg")])
+        if file_path:
+            file_name = os.path.basename(file_path)
+            dest_path = os.path.join(MASK_DIR, file_name)
+            try:
+                shutil.copy(file_path, dest_path)
+                config.need_reload_list = True
+                # 少し待ってからリスト更新
+                time.sleep(0.1)
+                new_list = get_mask_list()
+                self.option_mask.configure(values=new_list)
+                self.option_mask.set(file_name)
+                self.update_mask_choice(file_name)
+            except Exception as e:
+                print(f"Error adding file: {e}")
 
     def update_mask_choice(self, choice):
         config.current_mask_name = choice
+        self.update_preview()
         print(f"🎭 マスク切り替え: {choice}")
 
     def toggle_mask(self):
-        config.mask_enabled = self.switch_mask.get() == 1
+        config.mask_enabled = not config.mask_enabled
+        self.update_toggle_button_ui()
         print("🎭 マスクON" if config.mask_enabled else "🙈 マスクOFF")
+
+    def update_toggle_button_ui(self):
+        if config.mask_enabled:
+            self.btn_toggle.configure(text="マスクを無効にする", fg_color="#2d8659", hover_color="#236b47")
+        else:
+            self.btn_toggle.configure(text="マスクを有効にする", fg_color="#5a5a5a", hover_color="#4a4a4a")
 
     def update_scale(self, val):
         config.scale = val
@@ -221,11 +289,11 @@ class ControlApp(ctk.CTk):
 
     def update_smooth(self, val):
         config.smooth_frames = int(val)
-        self.label_smooth.configure(text=f"動きの滑らかさ (フレーム): {config.smooth_frames}")
+        self.label_smooth.configure(text=f"動きの滑らかさ: {config.smooth_frames}")
 
     def update_infer(self, val):
-        config.infer_interval = val / 1000.0
-        self.label_infer.configure(text=f"認識の頻度 (ミリ秒): {int(val)}")
+        config.infer_interval = max(0.001, val / 1000.0)
+        self.label_infer.configure(text=f"認識の頻度: {int(val)}ms")
 
     def on_closing(self):
         config.running = False

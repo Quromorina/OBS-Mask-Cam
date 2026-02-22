@@ -45,6 +45,17 @@ if config.mask_files:
 
 # --- アルファ合成 ---
 def overlay_transparent(background, overlay, x, y):
+    if overlay.shape[2] != 4:
+        # アルファチャンネルがない場合は単に上書き（安全策）
+        h, w = overlay.shape[:2]
+        bh, bw = background.shape[:2]
+        x1, y1 = max(x, 0), max(y, 0)
+        x2, y2 = min(x + w, bw), min(y + h, bh)
+        if x1 >= x2 or y1 >= y2: return background
+        overlay_rgb = overlay[:, :, :3]
+        background[y1:y2, x1:x2] = overlay_rgb[0:y2-y1, 0:x2-x1]
+        return background
+
     h, w = overlay.shape[:2]
     bh, bw = background.shape[:2]
     x1, y1 = max(x, 0), max(y, 0)
@@ -70,8 +81,15 @@ def camera_thread():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.height)
 
-    current_mask_path = os.path.join(MASK_DIR, config.current_mask_name)
-    overlay_img = cv2.imread(current_mask_path, cv2.IMREAD_UNCHANGED)
+    def load_mask(name):
+        path = os.path.join(MASK_DIR, name)
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is not None and img.shape[2] == 3:
+            # JPG等の透過なし画像は不透明なアルファを追加してBGRAに変換
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+        return img
+
+    overlay_img = load_mask(config.current_mask_name)
     loaded_mask_name = config.current_mask_name
 
     model = YOLO("yolov8n-face.pt")
@@ -93,12 +111,10 @@ def camera_thread():
 
             # マスクの切り替え判定
             if loaded_mask_name != config.current_mask_name:
-                mask_path = os.path.join(MASK_DIR, config.current_mask_name)
-                if os.path.exists(mask_path):
-                    new_img = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
-                    if new_img is not None:
-                        overlay_img = new_img
-                        loaded_mask_name = config.current_mask_name
+                new_img = load_mask(config.current_mask_name)
+                if new_img is not None:
+                    overlay_img = new_img
+                    loaded_mask_name = config.current_mask_name
 
             ret, frame = cap.read()
             if not ret:

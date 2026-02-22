@@ -14,6 +14,11 @@ import os
 import shutil
 from tkinter import filedialog
 from PIL import Image
+try:
+    from pygrabber.dshow_graph import FilterGraph
+    HAS_PYGRABBER = True
+except ImportError:
+    HAS_PYGRABBER = False
 
 # --- 設定（初期値） ---
 class AppConfig:
@@ -33,14 +38,22 @@ class AppConfig:
 config = AppConfig()
 
 # --- カメラ検出 ---
-def get_camera_list(max_to_test=10):
-    available = []
-    for i in range(max_to_test):
-        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
-        if cap.isOpened():
-            available.append(str(i))
-            cap.release()
-    return available if available else ["0"]
+def get_camera_list():
+    if HAS_PYGRABBER:
+        try:
+            graph = FilterGraph()
+            return graph.get_input_devices()
+        except Exception:
+            return ["0"]
+    else:
+        # フォールバック: OpenCVでの簡易スキャン
+        available = []
+        for i in range(5):
+            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
+            if cap.isOpened():
+                available.append(str(i))
+                cap.release()
+        return available if available else ["0"]
 
 config.camera_list = get_camera_list()
 
@@ -235,9 +248,13 @@ class ControlApp(ctk.CTk):
         self.label_camera = ctk.CTkLabel(self.camera_frame, text="映像ソース (カメラ):", font=self.font_bold)
         self.label_camera.pack(side="left", padx=10, pady=10)
         
-        self.option_camera = ctk.CTkOptionMenu(self.camera_frame, values=[f"Camera {c}" for c in config.camera_list], 
+        # 名前で表示
+        self.option_camera = ctk.CTkOptionMenu(self.camera_frame, values=config.camera_list, 
                                                font=self.font_main, command=self.update_camera_choice)
-        self.option_camera.set(f"Camera {config.camera_index}")
+        if config.camera_index < len(config.camera_list):
+            self.option_camera.set(config.camera_list[config.camera_index])
+        else:
+            self.option_camera.set(config.camera_list[0])
         self.option_camera.pack(side="right", padx=10, pady=10)
 
         # --- プレビューエリア ---
@@ -348,8 +365,12 @@ class ControlApp(ctk.CTk):
         print(f"🎭 マスク切り替え: {choice}")
 
     def update_camera_choice(self, choice):
-        index = int(choice.split(" ")[-1])
-        config.camera_index = index
+        try:
+            index = config.camera_list.index(choice)
+            config.camera_index = index
+            print(f"🎬 カメラ選択: {choice} (Index: {index})")
+        except ValueError:
+            pass
 
     def toggle_mask(self):
         config.mask_enabled = not config.mask_enabled

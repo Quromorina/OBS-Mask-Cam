@@ -25,7 +25,7 @@ class AppConfig:
     width, height, fps = 1280, 720, 30
     scale = 1.8
     mask_enabled = True
-    infer_interval = 0.02
+    infer_interval = 0.02  # 固定値: 20ms (変更不可)
     smooth_frames = 5
     distance_threshold = 50
     running = True
@@ -172,10 +172,13 @@ def camera_thread():
                     current_faces.append((cx, cy, face_size))
                 
                 new_face_history = {}
+                matched_old_ids = set()  # マッチ済みIDを追跡して二重マッチを防止
                 for (cx, cy, fs) in current_faces:
                     matched_id = None
                     min_dist = config.distance_threshold
                     for fid, data in face_history.items():
+                        if fid in matched_old_ids:  # 既にマッチ済みならスキップ
+                            continue
                         prev_cx, prev_cy, _ = data["history"][-1]
                         dist = np.sqrt((cx - prev_cx)**2 + (cy - prev_cy)**2)
                         if dist < min_dist:
@@ -183,6 +186,7 @@ def camera_thread():
                             matched_id = fid
                     
                     if matched_id is not None:
+                        matched_old_ids.add(matched_id)  # マッチ済みとして記録
                         history = face_history[matched_id]["history"]
                         history.append((cx, cy, fs))
                         if len(history) > 20: 
@@ -192,9 +196,18 @@ def camera_thread():
                         new_id = time.time() + np.random.rand()
                         new_face_history[new_id] = {"history": [(cx, cy, fs)], "last_update": now}
                 
+                # ゴースト保持: 現在の検出に近いものは移動した顔なので保持しない
                 for fid, data in face_history.items():
-                    if now - data["last_update"] < 0.5 and fid not in new_face_history:
-                        new_face_history[fid] = data
+                    if fid in matched_old_ids or fid in new_face_history:
+                        continue
+                    if now - data["last_update"] < 0.5:
+                        ghost_cx, ghost_cy, _ = data["history"][-1]
+                        near_current = any(
+                            np.sqrt((cx - ghost_cx)**2 + (cy - ghost_cy)**2) < config.distance_threshold * 3
+                            for (cx, cy, fs) in current_faces
+                        )
+                        if not near_current:
+                            new_face_history[fid] = data
 
                 face_history = new_face_history
                 last_infer_time = now
@@ -296,14 +309,9 @@ class ControlApp(ctk.CTk):
         self.label_smooth.pack(pady=(10, 0))
         self.slider_smooth = ctk.CTkSlider(self.settings_frame, from_=1, to=20, number_of_steps=19, command=self.update_smooth)
         self.slider_smooth.set(config.smooth_frames)
-        self.slider_smooth.pack(padx=20, pady=(0, 10), fill="x")
+        self.slider_smooth.pack(padx=20, pady=(0, 20), fill="x")
 
-        # 推論間隔調整
-        self.label_infer = ctk.CTkLabel(self.settings_frame, text=f"認識の頻度: {int(config.infer_interval * 1000)}ms", font=self.font_main)
-        self.label_infer.pack(pady=(10, 0))
-        self.slider_infer = ctk.CTkSlider(self.settings_frame, from_=1, to=500, command=self.update_infer)
-        self.slider_infer.set(config.infer_interval * 1000)
-        self.slider_infer.pack(padx=20, pady=(0, 20), fill="x")
+
 
         # 終了ボタン
         self.btn_quit = ctk.CTkButton(self, text="アプリを終了", height=40, font=self.font_bold, fg_color="#9e2b2b", hover_color="#7a2222", command=self.on_closing)
@@ -391,9 +399,7 @@ class ControlApp(ctk.CTk):
         config.smooth_frames = int(val)
         self.label_smooth.configure(text=f"動きの滑らかさ: {config.smooth_frames}")
 
-    def update_infer(self, val):
-        config.infer_interval = max(0.001, val / 1000.0)
-        self.label_infer.configure(text=f"認識の頻度: {int(val)}ms")
+
 
     def on_closing(self):
         config.running = False

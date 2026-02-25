@@ -68,7 +68,7 @@ class AppConfig:
     width, height, fps = 1280, 720, 30
     scale = 1.8
     mask_enabled = True
-    infer_interval = 0.02  # 固定値: 20ms (変更不可)
+    infer_interval = 0.01  # 固定値: 10ms
     smooth_frames = 5
     distance_threshold = 50
     running = True
@@ -416,16 +416,32 @@ def camera_thread():
                 for fid, data in face_history.items():
                     history = data["history"]
                     current_history = history[-config.smooth_frames:]
-                    avg_cx = int(np.mean([h[0] for h in current_history]))
-                    avg_cy = int(np.mean([h[1] for h in current_history]))
                     
-                    # 適応的スムージング: サイズ変化が大きい時は即追従
+                    # 適応的スムージング: 速い動きの時は即追従
+                    if len(current_history) >= 2:
+                        dx = abs(current_history[-1][0] - current_history[-2][0])
+                        dy = abs(current_history[-1][1] - current_history[-2][1])
+                        move_dist = np.sqrt(dx**2 + dy**2)
+                        # 顔サイズに対する移動量の比率で判定
+                        face_ref = max(current_history[-1][2], 1)
+                        move_ratio = move_dist / face_ref
+                        if move_ratio > 0.3:  # 顔サイズの30%以上移動
+                            # 最新2フレームだけで平均（即追従）
+                            use_hist = current_history[-2:]
+                        else:
+                            use_hist = current_history
+                    else:
+                        use_hist = current_history
+                    
+                    avg_cx = int(np.mean([h[0] for h in use_hist]))
+                    avg_cy = int(np.mean([h[1] for h in use_hist]))
+                    
+                    # サイズも適応的スムージング
                     sizes = [h[2] for h in current_history]
                     latest_fs = sizes[-1]
                     if len(sizes) >= 2:
                         size_change_ratio = abs(sizes[-1] - sizes[-2]) / max(sizes[-2], 1)
-                        if size_change_ratio > 0.15:  # 15%以上のサイズ変化
-                            # 最新2フレームだけで平均（即追従）
+                        if size_change_ratio > 0.15:
                             avg_fs = int(np.mean(sizes[-2:]))
                         else:
                             avg_fs = int(np.mean(sizes))

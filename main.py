@@ -68,6 +68,8 @@ class AppConfig:
     need_reload_list = False
     camera_index = 0
     camera_list = []
+    provider_name = ""           # GPU/CPU表示用
+    startup_error = ""           # 起動時エラーメッセージ
 
 config = AppConfig()
 
@@ -141,6 +143,7 @@ def create_onnx_session(model_path):
     
     session = ort.InferenceSession(model_path, providers=providers)
     active_provider = session.get_providers()[0]
+    config.provider_name = active_provider
     print(f"✅ Using provider: {active_provider}")
     return session
 
@@ -261,7 +264,12 @@ def overlay_transparent(background, overlay, x, y):
 
 # --- カメラ・AI処理スレッド ---
 def camera_thread():
+    # カメラ確認
     cap = cv2.VideoCapture(config.camera_index, cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
+    if not cap.isOpened():
+        config.startup_error = "camera"
+        print("❌ カメラが見つかりません")
+        return
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.height)
     last_camera_index = config.camera_index
@@ -296,9 +304,18 @@ def camera_thread():
     face_history = {}
     last_infer_time = 0
 
-    with pyvirtualcam.Camera(width=config.width, height=config.height, fps=config.fps, fmt=PixelFormat.BGR) as cam:
-        print(f'✅ Virtual camera started: {cam.device}')
+    # Virtual Camera接続
+    try:
+        cam = pyvirtualcam.Camera(width=config.width, height=config.height, fps=config.fps, fmt=PixelFormat.BGR)
+    except Exception as e:
+        config.startup_error = "virtualcam"
+        print(f"❌ OBS Virtual Cameraが見つかりません: {e}")
+        cap.release()
+        return
 
+    print(f'✅ Virtual camera started: {cam.device}')
+
+    try:
         while config.running:
             # カメラソースの切り替えチェック
             if last_camera_index != config.camera_index:
@@ -323,7 +340,13 @@ def camera_thread():
 
             ret, frame = cap.read()
             if not ret:
-                break
+                # カメラからフレーム取得失敗 → 黒画面を送る
+                frame = np.zeros((config.height, config.width, 3), dtype=np.uint8)
+                cv2.putText(frame, "Camera not available", (config.width//4, config.height//2),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 2)
+                cam.send(frame)
+                cam.sleep_until_next_frame()
+                continue
 
             now = time.time()
             if now - last_infer_time > config.infer_interval:
@@ -410,8 +433,9 @@ def camera_thread():
 
             cam.send(frame)
             cam.sleep_until_next_frame()
-
-    cap.release()
+    finally:
+        cam.close()
+        cap.release()
 
 # --- GUIクラス ---
 class ControlApp(ctk.CTk):
@@ -419,7 +443,7 @@ class ControlApp(ctk.CTk):
         super().__init__()
 
         self.title("OBS Mask Cam - コントロールパネル")
-        self.geometry("450x800")
+        self.geometry("450x850")
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
@@ -428,10 +452,33 @@ class ControlApp(ctk.CTk):
         self.font_bold = ("MS Gothic", 14, "bold")
         self.font_title = ("MS Gothic", 24, "bold")
         self.font_button = ("MS Gothic", 18, "bold")
+        self.font_small = ("MS Gothic", 10)
 
         # タイトル
         self.label_title = ctk.CTkLabel(self, text="🎭 OBS Mask Cam", font=self.font_title)
         self.label_title.pack(pady=15)
+
+        # --- ステータス表示 ---
+        self.status_frame = ctk.CTkFrame(self)
+        self.status_frame.pack(pady=5, padx=20, fill="x")
+        
+        provider_display = "✅ GPU推論 (DirectML)" if "Dml" in config.provider_name else "⚠ CPU推論（低速）"
+        provider_color = "#2d8659" if "Dml" in config.provider_name else "#9e6b2b"
+        self.label_provider = ctk.CTkLabel(self.status_frame, text=provider_display, 
+                                           font=self.font_small, text_color=provider_color)
+        self.label_provider.pack(pady=5)
+
+        # 起動エラーがあれば表示
+        if config.startup_error == "virtualcam":
+            self.label_error = ctk.CTkLabel(self.status_frame, 
+                text="❌ OBS Virtual Cameraが見つかりません\nOBS Studioをインストールしてください", 
+                font=self.font_small, text_color="#e74c3c", wraplength=380)
+            self.label_error.pack(pady=5)
+        elif config.startup_error == "camera":
+            self.label_error = ctk.CTkLabel(self.status_frame, 
+                text="❌ カメラが見つかりません\nWebカメラを接続してください", 
+                font=self.font_small, text_color="#e74c3c", wraplength=380)
+            self.label_error.pack(pady=5)
 
         # --- カメラ選択エリア ---
         self.camera_frame = ctk.CTkFrame(self)
@@ -440,7 +487,6 @@ class ControlApp(ctk.CTk):
         self.label_camera = ctk.CTkLabel(self.camera_frame, text="映像ソース (カメラ):", font=self.font_bold)
         self.label_camera.pack(side="left", padx=10, pady=10)
         
-        # 名前で表示
         self.option_camera = ctk.CTkOptionMenu(self.camera_frame, values=config.camera_list, 
                                                font=self.font_main, command=self.update_camera_choice)
         if config.camera_index < len(config.camera_list):
@@ -476,14 +522,12 @@ class ControlApp(ctk.CTk):
         self.settings_frame = ctk.CTkFrame(self)
         self.settings_frame.pack(pady=10, padx=20, fill="x")
 
-        # マスクサイズ調整
         self.label_scale = ctk.CTkLabel(self.settings_frame, text=f"マスクの大きさ: {config.scale:.1f}", font=self.font_main)
         self.label_scale.pack(pady=(10, 0))
         self.slider_scale = ctk.CTkSlider(self.settings_frame, from_=1.0, to=4.0, command=self.update_scale)
         self.slider_scale.set(config.scale)
         self.slider_scale.pack(padx=20, pady=(0, 10), fill="x")
 
-        # スムージング調整
         self.label_smooth = ctk.CTkLabel(self.settings_frame, text=f"動きの滑らかさ: {config.smooth_frames}", font=self.font_main)
         self.label_smooth.pack(pady=(10, 0))
         self.slider_smooth = ctk.CTkSlider(self.settings_frame, from_=1, to=20, number_of_steps=19, command=self.update_smooth)

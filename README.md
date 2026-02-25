@@ -1,53 +1,104 @@
-# OBS-Mask-Cam
+# 🎭 OBS Mask Cam
 
-🎭 YOLOv8 を使用したリアルタイム顔認識マスクツール
+AIがリアルタイムで顔を検出し、マスク画像を重ねてOBS Virtual Cameraに出力するアプリケーションです。  
+配信やビデオ通話で顔を隠したい時に使えます。
 
-このプロジェクトは、Webカメラからの映像を解析し、検出された顔に自動でマスク画像を合成して仮想カメラへ出力します。OBS 等の配信ソフトでそのまま使用することが可能です。
+---
 
-## 機能
+## ✨ 特徴
 
-- **リアルタイム顔認識**: YOLOv8n-face を使用した高速・高精度な顔検出
-- **仮想カメラ出力**: `pyvirtualcam` を使用し、OBS 等で認識可能な仮想デバイスとして出力
-- **動的切り替え**: 実行中に `M` キーでマスクの有効/無効を切り替え可能
-- **GPU サポート**: CUDA が利用可能な環境では自動的に GPU を使用して推論
+- **リアルタイム顔検出** — YOLOv8ベースのAIモデル（ONNX）を使用
+- **GPU推論対応** — DirectMLにより NVIDIA / AMD / Intel どのGPUでも高速推論
+- **Python不要** — ビルド済みEXEをダウンロードするだけで使える
+- **マスク追加可能** — 好きな画像をマスクとして追加できる
+- **OBS Virtual Camera** — OBSやZoom、Discordなどに仮想カメラとして出力
 
-## セットアップ
+---
 
-### 必要なもの
-- Python 3.8以上
-- Webカメラ
-- [OBS Virtual Camera](https://obsproject.com/) (Windows の場合、OBSをインストールすると自動で入ります)
+## 📦 必要なもの
 
-### インストール
-
-```bash
-# リポジトリをクローン（またはダウンロード）
-git clone https://github.com/Quromorina/OBS-Mask-Cam.git
-cd OBS-Mask-Cam
-
-# 依存ライブラリのインストール
-pip install -r requirements.txt
-```
+| 必要なソフト | 説明 |
+|---|---|
+| **OBS Studio** | Virtual Cameraのドライバとして必要です。[ダウンロード](https://obsproject.com/ja/download) |
+| **Webカメラ** | PCに内蔵 or USB接続のカメラ |
 
 > [!NOTE]
-> `pyvirtualcam` の動作には、対応する仮想カメラドライバ（OBS Virtual Camera など）が必要です。
+> GPUがなくてもCPUモードで動作しますが、推論速度が遅くなります。
 
-## 使い方
+---
 
-1. `main.py` を実行します。
-   ```bash
-   python main.py
-   ```
-2. OBS 等の配信ソフトを開き、映像キャプチャデバイスから **"OBS Virtual Camera"** を選択します。
-3. 実行中のコンソール（またはダミーウィンドウ）で以下の操作が可能です：
-   - `M` キー: マスクの ON/OFF 切り替え
-   - `Q` キー: プログラムの終了
+## 🚀 使い方
 
-## カスタマイズ
+### EXE版（推奨）
 
-- **マスク画像の変更**: `mask.png` を好きな画像（背景透過の PNG 推奨）に差し替えることで、マスクを変更できます。
-- **設定の変更**: `main.py` 内の `scale` 変数を調整することで、マスクの大きさを変更できます。
+1. [Releases](https://github.com/Quromorina/OBS-Mask-Cam/releases) から最新の `OBSMaskCam.zip` をダウンロード
+2. ZIPを解凍
+3. `OBSMaskCam.exe` をダブルクリック
+4. **OBS Studio** を起動し、ソースに「映像キャプチャデバイス」→「OBS Virtual Camera」を選択
 
-## ライセンス
+### Python版（開発者向け）
 
-[MIT License](LICENSE) (または任意のライセンス)
+```bash
+git clone https://github.com/Quromorina/OBS-Mask-Cam.git
+cd OBS-Mask-Cam
+pip install -r requirements.txt
+python main.py
+```
+
+---
+
+## 🎭 マスクの追加方法
+
+1. アプリのコントロールパネルで「➕ 新しいマスクを追加」をクリック
+2. 好きな画像ファイル（PNG/JPG/BMP/WebP）を選択
+3. 自動的に透過対応PNGに変換されて `masks/` フォルダに保存されます
+
+> [!TIP]
+> 透過PNGを使うと、顔の上に自然に画像が重なります。
+
+---
+
+## 🎮 コントロールパネル
+
+| 機能 | 説明 |
+|---|---|
+| **映像ソース** | 使用するカメラを選択 |
+| **マスク選択** | 使うマスク画像を切り替え |
+| **マスクON/OFF** | マスクの有効/無効を切り替え |
+| **マスクの大きさ** | 顔に対するマスクのサイズを調整 |
+| **動きの滑らかさ** | マスクの追尾の滑らかさを調整 |
+
+---
+
+## ⚠ トラブルシューティング
+
+### 「OBS Virtual Cameraが見つかりません」
+
+- **OBS Studio** がインストールされていることを確認してください
+- OBSを一度起動してから再度アプリを起動してください
+
+### 「カメラが見つかりません」
+
+- Webカメラが正しく接続されているか確認してください
+- 他のアプリがカメラを占有していないか確認してください
+
+### マスクが遅い・カクカクする
+
+- GPU推論で動作しているか確認してください（コントロールパネル上部に表示）
+- 「⚠ CPU推論（低速）」と表示されている場合、GPUドライバの更新を試してください
+
+---
+
+## 🛠 技術スタック
+
+- **顔検出**: YOLOv8n-face (ONNX)
+- **推論エンジン**: ONNX Runtime + DirectML
+- **GUI**: CustomTkinter
+- **仮想カメラ**: pyvirtualcam
+- **ビルド**: PyInstaller
+
+---
+
+## 📄 ライセンス
+
+MIT License

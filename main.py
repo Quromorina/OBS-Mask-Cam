@@ -1,16 +1,13 @@
-import logging
-logging.getLogger("ultralytics").setLevel(logging.CRITICAL)
-
 import cv2
 import numpy as np
 import pyvirtualcam
 from pyvirtualcam import PixelFormat
-from ultralytics import YOLO
+import onnxruntime as ort
 import time
-import torch
 import threading
 import customtkinter as ctk
 import os
+import sys
 import shutil
 from tkinter import filedialog
 from PIL import Image
@@ -19,6 +16,43 @@ try:
     HAS_PYGRABBER = True
 except ImportError:
     HAS_PYGRABBER = False
+
+# --- 日本語パス対応のOpenCVヘルパー ---
+def imread_safe(path, flags=cv2.IMREAD_UNCHANGED):
+    """日本語パスでも読み込めるcv2.imread代替"""
+    try:
+        buf = np.fromfile(path, dtype=np.uint8)
+        return cv2.imdecode(buf, flags)
+    except Exception:
+        return None
+
+def imwrite_safe(path, img):
+    """日本語パスでも保存できるcv2.imwrite代替"""
+    ext = os.path.splitext(path)[1]
+    result, buf = cv2.imencode(ext, img)
+    if result:
+        buf.tofile(path)
+        return True
+    return False
+
+# --- パス解決（EXE対応） ---
+IS_FROZEN = getattr(sys, 'frozen', False)
+if IS_FROZEN:
+    # PyInstallerでビルドされたEXEの場合
+    APP_DIR = os.path.dirname(sys.executable)
+    BUNDLE_DIR = getattr(sys, '_MEIPASS', APP_DIR)
+else:
+    # 通常のPython実行
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+    BUNDLE_DIR = APP_DIR
+
+MODEL_PATH = os.path.join(BUNDLE_DIR, "yolov8n-face.onnx")
+MASK_DIR = os.path.join(APP_DIR, "masks")
+
+print(f"📁 APP_DIR: {APP_DIR}")
+print(f"📁 BUNDLE_DIR: {BUNDLE_DIR}")
+print(f"📁 MODEL_PATH: {MODEL_PATH} (exists: {os.path.exists(MODEL_PATH)})")
+print(f"📁 MASK_DIR: {MASK_DIR}")
 
 # --- 設定（初期値） ---
 class AppConfig:
@@ -29,7 +63,7 @@ class AppConfig:
     smooth_frames = 5
     distance_threshold = 50
     running = True
-    current_mask_name = "mask.png"
+    current_mask_name = ""
     mask_files = []
     need_reload_list = False
     camera_index = 0
@@ -57,18 +91,141 @@ def get_camera_list():
 
 config.camera_list = get_camera_list()
 
-# --- フォルダ準備 ---
-MASK_DIR = "masks"
+# --- フォルダ準備＆デフォルトマスク初期化 ---
 if not os.path.exists(MASK_DIR):
     os.makedirs(MASK_DIR)
+    print(f"📁 masksフォルダ作成: {MASK_DIR}")
+
+# masksフォルダ内に画像が1つもない場合、モザイクマスクを自動生成
+def _generate_default_mask():
+    """デフォルトのモザイクパターンマスクを生成"""
+    size = 256
+    img = np.zeros((size, size, 4), dtype=np.uint8)
+    block = 16
+    rng = np.random.RandomState(42)  # 再現性のため固定シード
+    for y in range(0, size, block):
+        for x in range(0, size, block):
+            c = rng.randint(60, 200)
+            img[y:y+block, x:x+block] = (c, c, c, 220)
+    path = os.path.join(MASK_DIR, "mosaic.png")
+    imwrite_safe(path, img)
+    print(f"🎭 デフォルトモザイクマスク生成: {path}")
+    return "mosaic.png"
 
 def get_mask_list():
     files = [f for f in os.listdir(MASK_DIR) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp'))]
-    return files if files else ["mask.png"]
+    return files
 
 config.mask_files = get_mask_list()
+if not config.mask_files:
+    # マスクが1つもない → デフォルト生成
+    default_name = _generate_default_mask()
+    config.mask_files = get_mask_list()
+
 if config.mask_files:
     config.current_mask_name = config.mask_files[0]
+    print(f"🎭 初期マスク: {config.current_mask_name}")
+else:
+    config.current_mask_name = ""
+    print("⚠ マスク画像が見つかりません")
+
+# --- ONNX推論ヘルパー ---
+def create_onnx_session(model_path):
+    """作成ONNX Runtimeセッション（DirectML → CPU fallback）"""
+    providers = []
+    available = ort.get_available_providers()
+    print(f"🔍 利用可能なProvider: {available}")
+    if 'DmlExecutionProvider' in available:
+        providers.append('DmlExecutionProvider')
+    providers.append('CPUExecutionProvider')
+    
+    session = ort.InferenceSession(model_path, providers=providers)
+    active_provider = session.get_providers()[0]
+    print(f"✅ Using provider: {active_provider}")
+    return session
+
+def preprocess(frame, input_size=640):
+    """フレームをONNX入力形式にリサイズ＆正規化"""
+    h, w = frame.shape[:2]
+    scale = min(input_size / w, input_size / h)
+    new_w, new_h = int(w * scale), int(h * scale)
+    resized = cv2.resize(frame, (new_w, new_h))
+    
+    # パディングして正方形に
+    padded = np.full((input_size, input_size, 3), 114, dtype=np.uint8)
+    padded[:new_h, :new_w] = resized
+    
+    # BGR→RGB, HWC→CHW, 正規化
+    blob = padded[:, :, ::-1].transpose(2, 0, 1).astype(np.float32) / 255.0
+    blob = np.expand_dims(blob, axis=0)
+    return blob, scale, 0, 0  # pad_x, pad_y は0（左上寄せ）
+
+def nms(boxes, scores, iou_threshold=0.45):
+    """Non-Maximum Suppression"""
+    if len(boxes) == 0:
+        return []
+    
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+    areas = (x2 - x1) * (y2 - y1)
+    order = scores.argsort()[::-1]
+    
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+        
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        
+        inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
+        iou = inter / (areas[i] + areas[order[1:]] - inter)
+        
+        inds = np.where(iou <= iou_threshold)[0]
+        order = order[inds + 1]
+    
+    return keep
+
+def postprocess(output, scale, orig_w, orig_h, conf_threshold=0.5, iou_threshold=0.45):
+    """YOLOv8出力を処理して顔バウンディングボックスを返す"""
+    # output shape: (1, 5, 8400) → transpose → (8400, 5) : [cx, cy, w, h, conf]
+    predictions = output[0].transpose()
+    
+    # 信頼度フィルタ
+    scores = predictions[:, 4]
+    mask = scores > conf_threshold
+    predictions = predictions[mask]
+    scores = scores[mask]
+    
+    if len(predictions) == 0:
+        return []
+    
+    # cx, cy, w, h → x1, y1, x2, y2
+    cx, cy, w, h = predictions[:, 0], predictions[:, 1], predictions[:, 2], predictions[:, 3]
+    x1 = cx - w / 2
+    y1 = cy - h / 2
+    x2 = cx + w / 2
+    y2 = cy + h / 2
+    
+    boxes = np.stack([x1, y1, x2, y2], axis=1)
+    
+    # NMS
+    keep = nms(boxes, scores, iou_threshold)
+    boxes = boxes[keep]
+    
+    # スケールを元画像サイズに戻す
+    boxes[:, [0, 2]] = boxes[:, [0, 2]] / scale
+    boxes[:, [1, 3]] = boxes[:, [1, 3]] / scale
+    
+    # クリッピング
+    boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, orig_w)
+    boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, orig_h)
+    
+    return boxes.astype(int)
 
 # --- アルファ合成 ---
 def overlay_transparent(background, overlay, x, y):
@@ -110,24 +267,31 @@ def camera_thread():
     last_camera_index = config.camera_index
 
     def load_mask(name):
+        if not name:
+            print("⚠ マスク名が空です")
+            return None
         path = os.path.join(MASK_DIR, name)
-        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if not os.path.exists(path):
+            print(f"⚠ マスクファイルが見つかりません: {path}")
+            return None
+        img = imread_safe(path, cv2.IMREAD_UNCHANGED)
         if img is None:
+            print(f"⚠ マスク画像の読み込み失敗: {path}")
             return None
         
         if len(img.shape) == 2: # グレースケール
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
         elif img.shape[2] == 3: # BGR
             img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+        print(f"✅ マスク読み込み成功: {name} ({img.shape})")
         return img
 
     overlay_img = load_mask(config.current_mask_name)
     loaded_mask_name = config.current_mask_name
 
-    model = YOLO("yolov8n-face.pt")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model.to(device)
-    print(f"Using device: {device}")
+    # ONNX Runtimeセッション作成
+    session = create_onnx_session(MODEL_PATH)
+    input_name = session.get_inputs()[0].name
 
     face_history = {}
     last_infer_time = 0
@@ -163,10 +327,14 @@ def camera_thread():
 
             now = time.time()
             if now - last_infer_time > config.infer_interval:
-                results = model.predict(frame, verbose=False)[0]
+                # ONNX推論
+                blob, scale, _, _ = preprocess(frame, 640)
+                output = session.run(None, {input_name: blob})[0]
+                boxes = postprocess(output, scale, frame.shape[1], frame.shape[0])
+                
                 current_faces = []
-                for box in results.boxes.xyxy:
-                    x1, y1, x2, y2 = map(int, box[:4])
+                for box in boxes:
+                    x1, y1, x2, y2 = box
                     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
                     face_size = int(max(x2 - x1, y2 - y1) * config.scale)
                     current_faces.append((cx, cy, face_size))
@@ -218,7 +386,19 @@ def camera_thread():
                     current_history = history[-config.smooth_frames:]
                     avg_cx = int(np.mean([h[0] for h in current_history]))
                     avg_cy = int(np.mean([h[1] for h in current_history]))
-                    avg_fs = int(np.mean([h[2] for h in current_history]))
+                    
+                    # 適応的スムージング: サイズ変化が大きい時は即追従
+                    sizes = [h[2] for h in current_history]
+                    latest_fs = sizes[-1]
+                    if len(sizes) >= 2:
+                        size_change_ratio = abs(sizes[-1] - sizes[-2]) / max(sizes[-2], 1)
+                        if size_change_ratio > 0.15:  # 15%以上のサイズ変化
+                            # 最新2フレームだけで平均（即追従）
+                            avg_fs = int(np.mean(sizes[-2:]))
+                        else:
+                            avg_fs = int(np.mean(sizes))
+                    else:
+                        avg_fs = latest_fs
 
                     try:
                         resized = cv2.resize(overlay_img, (avg_fs, avg_fs))
@@ -233,7 +413,6 @@ def camera_thread():
 
     cap.release()
 
-# --- GUIクラス ---
 # --- GUIクラス ---
 class ControlApp(ctk.CTk):
     def __init__(self):
@@ -311,8 +490,6 @@ class ControlApp(ctk.CTk):
         self.slider_smooth.set(config.smooth_frames)
         self.slider_smooth.pack(padx=20, pady=(0, 20), fill="x")
 
-
-
         # 終了ボタン
         self.btn_quit = ctk.CTkButton(self, text="アプリを終了", height=40, font=self.font_bold, fg_color="#9e2b2b", hover_color="#7a2222", command=self.on_closing)
         self.btn_quit.pack(pady=(20, 30))
@@ -342,7 +519,7 @@ class ControlApp(ctk.CTk):
         if file_path:
             try:
                 # 画像を読み込んでチャンネル数を確認
-                img = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
+                img = imread_safe(file_path, cv2.IMREAD_UNCHANGED)
                 if img is None: return
 
                 if len(img.shape) == 2: # グレースケール
@@ -355,7 +532,7 @@ class ControlApp(ctk.CTk):
                 new_file_name = f"{base_name}.png"
                 dest_path = os.path.join(MASK_DIR, new_file_name)
                 
-                cv2.imwrite(dest_path, img)
+                imwrite_safe(dest_path, img)
                 print(f"✅ 画像を透過対応PNGとして保存しました: {new_file_name}")
 
                 config.need_reload_list = True
@@ -398,8 +575,6 @@ class ControlApp(ctk.CTk):
     def update_smooth(self, val):
         config.smooth_frames = int(val)
         self.label_smooth.configure(text=f"動きの滑らかさ: {config.smooth_frames}")
-
-
 
     def on_closing(self):
         config.running = False

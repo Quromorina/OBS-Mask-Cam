@@ -24,3 +24,7 @@ masks/*
 # OS
 .DS_Store
 Thumbs.db
+
+# Masks - 画像はローカル管理、Githubにはアップしない
+masks/*
+!masks/.gitkeep

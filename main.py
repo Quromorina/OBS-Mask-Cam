@@ -8,26 +8,81 @@ from pyvirtualcam import PixelFormat
 from ultralytics import YOLO
 import time
 import torch
+import threading
+import customtkinter as ctk
+import os
+import shutil
+from tkinter import filedialog
+from PIL import Image
+try:
+    from pygrabber.dshow_graph import FilterGraph
+    HAS_PYGRABBER = True
+except ImportError:
+    HAS_PYGRABBER = False
 
-# 設定
-width, height, fps = 1280, 720, 30
-scale = 1.8
-mask_enabled = True
-infer_interval = 0.02  # 秒（推論頻度：0.5なら2回/秒、1.0なら1回/秒）
+# --- 設定（初期値） ---
+class AppConfig:
+    width, height, fps = 1280, 720, 30
+    scale = 1.8
+    mask_enabled = True
+    infer_interval = 0.02  # 固定値: 20ms (変更不可)
+    smooth_frames = 5
+    distance_threshold = 50
+    running = True
+    current_mask_name = "mask.png"
+    mask_files = []
+    need_reload_list = False
+    camera_index = 0
+    camera_list = []
 
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+config = AppConfig()
 
-overlay_img = cv2.imread("masks/mask.png", cv2.IMREAD_UNCHANGED)
-model = YOLO("yolov8n-face.pt")
-# デバイス自動選択（CUDA が使えなければ CPU にフォールバック）
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model.to(device)
-print(f"Using device: {device}")
+# --- カメラ検出 ---
+def get_camera_list():
+    if HAS_PYGRABBER:
+        try:
+            graph = FilterGraph()
+            return graph.get_input_devices()
+        except Exception:
+            return ["0"]
+    else:
+        # フォールバック: OpenCVでの簡易スキャン
+        available = []
+        for i in range(5):
+            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
+            if cap.isOpened():
+                available.append(str(i))
+                cap.release()
+        return available if available else ["0"]
 
-# アルファ合成
+config.camera_list = get_camera_list()
+
+# --- フォルダ準備 ---
+MASK_DIR = "masks"
+if not os.path.exists(MASK_DIR):
+    os.makedirs(MASK_DIR)
+
+def get_mask_list():
+    files = [f for f in os.listdir(MASK_DIR) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp'))]
+    return files if files else ["mask.png"]
+
+config.mask_files = get_mask_list()
+if config.mask_files:
+    config.current_mask_name = config.mask_files[0]
+
+# --- アルファ合成 ---
 def overlay_transparent(background, overlay, x, y):
+    if overlay.shape[2] != 4:
+        # アルファチャンネルがない場合は単に上書き（安全策）
+        h, w = overlay.shape[:2]
+        bh, bw = background.shape[:2]
+        x1, y1 = max(x, 0), max(y, 0)
+        x2, y2 = min(x + w, bw), min(y + h, bh)
+        if x1 >= x2 or y1 >= y2: return background
+        overlay_rgb = overlay[:, :, :3]
+        background[y1:y2, x1:x2] = overlay_rgb[0:y2-y1, 0:x2-x1]
+        return background
+
     h, w = overlay.shape[:2]
     bh, bw = background.shape[:2]
     x1, y1 = max(x, 0), max(y, 0)
@@ -47,54 +102,314 @@ def overlay_transparent(background, overlay, x, y):
     background[y1:y2, x1:x2] = cv2.add(img1_bg, img2_fg)
     return background
 
-# ダミーウィンドウ（キー入力用）
-cv2.namedWindow("HiddenWindow", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("HiddenWindow", 1, 1)
+# --- カメラ・AI処理スレッド ---
+def camera_thread():
+    cap = cv2.VideoCapture(config.camera_index, cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.height)
+    last_camera_index = config.camera_index
 
-# 推論保持
-last_boxes = []
-last_infer_time = 0
+    def load_mask(name):
+        path = os.path.join(MASK_DIR, name)
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return None
+        
+        if len(img.shape) == 2: # グレースケール
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
+        elif img.shape[2] == 3: # BGR
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+        return img
 
-with pyvirtualcam.Camera(width=width, height=height, fps=fps, fmt=PixelFormat.BGR) as cam:
-    print(f'✅ Virtual camera started: {cam.device}')
-    print("🎭 Mキーでマスク切替、Qキーで終了")
+    overlay_img = load_mask(config.current_mask_name)
+    loaded_mask_name = config.current_mask_name
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    model = YOLO("yolov8n-face.pt")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    print(f"Using device: {device}")
 
-        cv2.imshow("HiddenWindow", np.zeros((1, 1), dtype=np.uint8))
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('m'):
-            mask_enabled = not mask_enabled
-            print("🎭 マスクON" if mask_enabled else "🙈 マスクOFF")
-        elif key == ord('q'):
-            print("👋 終了します")
-            break
+    face_history = {}
+    last_infer_time = 0
 
-        now = time.time()
-        # 一定間隔ごとに推論
-        if now - last_infer_time > infer_interval:
-            results = model.predict(frame, verbose=False)[0]
-            last_boxes = [box.cpu().numpy() for box in results.boxes.xyxy]
-            last_infer_time = now
+    with pyvirtualcam.Camera(width=config.width, height=config.height, fps=config.fps, fmt=PixelFormat.BGR) as cam:
+        print(f'✅ Virtual camera started: {cam.device}')
 
-        # 前回 or 最新の検出結果でマスク合成
-        if mask_enabled:
-            for box in last_boxes:
-                x1, y1, x2, y2 = map(int, box[:4])
-                cx = (x1 + x2) // 2
-                cy = (y1 + y2) // 2
-                face_w = x2 - x1
-                face_h = y2 - y1
-                face_size = int(max(face_w, face_h) * scale)
-                resized = cv2.resize(overlay_img, (face_size, face_size))
-                x_offset = cx - face_size // 2
-                y_offset = cy - face_size // 2
-                frame = overlay_transparent(frame, resized, x_offset, y_offset)
+        while config.running:
+            # カメラソースの切り替えチェック
+            if last_camera_index != config.camera_index:
+                print(f"🔄 カメラ切り替え中: Index {config.camera_index}")
+                cap.release()
+                cap = cv2.VideoCapture(config.camera_index, cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.height)
+                last_camera_index = config.camera_index
 
-        cam.send(frame)
-        cam.sleep_until_next_frame()
+            # マスクリストの更新チェック
+            if config.need_reload_list:
+                config.mask_files = get_mask_list()
+                config.need_reload_list = False
 
-cv2.destroyAllWindows()
+            # マスクの切り替え判定
+            if loaded_mask_name != config.current_mask_name:
+                new_img = load_mask(config.current_mask_name)
+                if new_img is not None:
+                    overlay_img = new_img
+                    loaded_mask_name = config.current_mask_name
+
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            now = time.time()
+            if now - last_infer_time > config.infer_interval:
+                results = model.predict(frame, verbose=False)[0]
+                current_faces = []
+                for box in results.boxes.xyxy:
+                    x1, y1, x2, y2 = map(int, box[:4])
+                    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                    face_size = int(max(x2 - x1, y2 - y1) * config.scale)
+                    current_faces.append((cx, cy, face_size))
+                
+                new_face_history = {}
+                matched_old_ids = set()  # マッチ済みIDを追跡して二重マッチを防止
+                for (cx, cy, fs) in current_faces:
+                    matched_id = None
+                    min_dist = config.distance_threshold
+                    for fid, data in face_history.items():
+                        if fid in matched_old_ids:  # 既にマッチ済みならスキップ
+                            continue
+                        prev_cx, prev_cy, _ = data["history"][-1]
+                        dist = np.sqrt((cx - prev_cx)**2 + (cy - prev_cy)**2)
+                        if dist < min_dist:
+                            min_dist = dist
+                            matched_id = fid
+                    
+                    if matched_id is not None:
+                        matched_old_ids.add(matched_id)  # マッチ済みとして記録
+                        history = face_history[matched_id]["history"]
+                        history.append((cx, cy, fs))
+                        if len(history) > 20: 
+                            history.pop(0)
+                        new_face_history[matched_id] = {"history": history, "last_update": now}
+                    else:
+                        new_id = time.time() + np.random.rand()
+                        new_face_history[new_id] = {"history": [(cx, cy, fs)], "last_update": now}
+                
+                # ゴースト保持: 現在の検出に近いものは移動した顔なので保持しない
+                for fid, data in face_history.items():
+                    if fid in matched_old_ids or fid in new_face_history:
+                        continue
+                    if now - data["last_update"] < 0.5:
+                        ghost_cx, ghost_cy, _ = data["history"][-1]
+                        near_current = any(
+                            np.sqrt((cx - ghost_cx)**2 + (cy - ghost_cy)**2) < config.distance_threshold * 3
+                            for (cx, cy, fs) in current_faces
+                        )
+                        if not near_current:
+                            new_face_history[fid] = data
+
+                face_history = new_face_history
+                last_infer_time = now
+
+            if config.mask_enabled and overlay_img is not None:
+                for fid, data in face_history.items():
+                    history = data["history"]
+                    current_history = history[-config.smooth_frames:]
+                    avg_cx = int(np.mean([h[0] for h in current_history]))
+                    avg_cy = int(np.mean([h[1] for h in current_history]))
+                    avg_fs = int(np.mean([h[2] for h in current_history]))
+
+                    try:
+                        resized = cv2.resize(overlay_img, (avg_fs, avg_fs))
+                        x_offset = avg_cx - avg_fs // 2
+                        y_offset = avg_cy - avg_fs // 2
+                        frame = overlay_transparent(frame, resized, x_offset, y_offset)
+                    except cv2.error:
+                        continue
+
+            cam.send(frame)
+            cam.sleep_until_next_frame()
+
+    cap.release()
+
+# --- GUIクラス ---
+# --- GUIクラス ---
+class ControlApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("OBS Mask Cam - コントロールパネル")
+        self.geometry("450x800")
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
+
+        # フォント設定
+        self.font_main = ("MS Gothic", 12)
+        self.font_bold = ("MS Gothic", 14, "bold")
+        self.font_title = ("MS Gothic", 24, "bold")
+        self.font_button = ("MS Gothic", 18, "bold")
+
+        # タイトル
+        self.label_title = ctk.CTkLabel(self, text="🎭 OBS Mask Cam", font=self.font_title)
+        self.label_title.pack(pady=15)
+
+        # --- カメラ選択エリア ---
+        self.camera_frame = ctk.CTkFrame(self)
+        self.camera_frame.pack(pady=10, padx=20, fill="x")
+        
+        self.label_camera = ctk.CTkLabel(self.camera_frame, text="映像ソース (カメラ):", font=self.font_bold)
+        self.label_camera.pack(side="left", padx=10, pady=10)
+        
+        # 名前で表示
+        self.option_camera = ctk.CTkOptionMenu(self.camera_frame, values=config.camera_list, 
+                                               font=self.font_main, command=self.update_camera_choice)
+        if config.camera_index < len(config.camera_list):
+            self.option_camera.set(config.camera_list[config.camera_index])
+        else:
+            self.option_camera.set(config.camera_list[0])
+        self.option_camera.pack(side="right", padx=10, pady=10)
+
+        # --- プレビューエリア ---
+        self.preview_frame = ctk.CTkFrame(self, width=200, height=200)
+        self.preview_frame.pack(pady=10)
+        self.preview_label = ctk.CTkLabel(self.preview_frame, text="画像なし", font=self.font_main)
+        self.preview_label.place(relx=0.5, rely=0.5, anchor="center")
+        
+        # --- マスク選択・追加 ---
+        self.label_mask_choice = ctk.CTkLabel(self, text="使用するマスク選択:", font=self.font_bold)
+        self.label_mask_choice.pack(pady=(10, 0))
+        
+        self.option_mask = ctk.CTkOptionMenu(self, values=config.mask_files, font=self.font_main, dropdown_font=self.font_main, command=self.update_mask_choice)
+        self.option_mask.set(config.current_mask_name)
+        self.option_mask.pack(pady=5)
+
+        self.btn_add_mask = ctk.CTkButton(self, text="➕ 新しいマスクを追加", font=self.font_main, fg_color="#2b719e", command=self.add_mask_file)
+        self.btn_add_mask.pack(pady=5)
+
+        # --- マスクON/OFF 大ボタン ---
+        self.btn_toggle = ctk.CTkButton(self, text="マスクを無効にする", height=60, font=self.font_button,
+                                        fg_color="#2d8659", hover_color="#236b47", command=self.toggle_mask)
+        self.btn_toggle.pack(pady=20, padx=40, fill="x")
+        self.update_toggle_button_ui()
+
+        # --- 設定エリア ---
+        self.settings_frame = ctk.CTkFrame(self)
+        self.settings_frame.pack(pady=10, padx=20, fill="x")
+
+        # マスクサイズ調整
+        self.label_scale = ctk.CTkLabel(self.settings_frame, text=f"マスクの大きさ: {config.scale:.1f}", font=self.font_main)
+        self.label_scale.pack(pady=(10, 0))
+        self.slider_scale = ctk.CTkSlider(self.settings_frame, from_=1.0, to=4.0, command=self.update_scale)
+        self.slider_scale.set(config.scale)
+        self.slider_scale.pack(padx=20, pady=(0, 10), fill="x")
+
+        # スムージング調整
+        self.label_smooth = ctk.CTkLabel(self.settings_frame, text=f"動きの滑らかさ: {config.smooth_frames}", font=self.font_main)
+        self.label_smooth.pack(pady=(10, 0))
+        self.slider_smooth = ctk.CTkSlider(self.settings_frame, from_=1, to=20, number_of_steps=19, command=self.update_smooth)
+        self.slider_smooth.set(config.smooth_frames)
+        self.slider_smooth.pack(padx=20, pady=(0, 20), fill="x")
+
+
+
+        # 終了ボタン
+        self.btn_quit = ctk.CTkButton(self, text="アプリを終了", height=40, font=self.font_bold, fg_color="#9e2b2b", hover_color="#7a2222", command=self.on_closing)
+        self.btn_quit.pack(pady=(20, 30))
+
+        self.update_preview()
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def update_preview(self):
+        try:
+            path = os.path.join(MASK_DIR, config.current_mask_name)
+            if os.path.exists(path):
+                img = Image.open(path)
+                aspect = img.width / img.height
+                if aspect > 1:
+                    w, h = 180, int(180 / aspect)
+                else:
+                    w, h = int(180 * aspect), 180
+                
+                ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(w, h))
+                self.preview_label.configure(image=ctk_img, text="")
+        except Exception as e:
+            self.preview_label.configure(image=None, text="エラー", font=self.font_main)
+            print(f"Preview error: {e}")
+
+    def add_mask_file(self):
+        file_path = filedialog.askopenfilename(filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.webp")])
+        if file_path:
+            try:
+                # 画像を読み込んでチャンネル数を確認
+                img = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
+                if img is None: return
+
+                if len(img.shape) == 2: # グレースケール
+                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
+                elif img.shape[2] == 3: # BGR
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+                
+                # ファイル名を強制的に .png に変更して保存
+                base_name = os.path.splitext(os.path.basename(file_path))[0]
+                new_file_name = f"{base_name}.png"
+                dest_path = os.path.join(MASK_DIR, new_file_name)
+                
+                cv2.imwrite(dest_path, img)
+                print(f"✅ 画像を透過対応PNGとして保存しました: {new_file_name}")
+
+                config.need_reload_list = True
+                time.sleep(0.1)
+                new_list = get_mask_list()
+                self.option_mask.configure(values=new_list)
+                self.option_mask.set(new_file_name)
+                self.update_mask_choice(new_file_name)
+            except Exception as e:
+                print(f"Error adding file: {e}")
+
+    def update_mask_choice(self, choice):
+        config.current_mask_name = choice
+        self.update_preview()
+        print(f"🎭 マスク切り替え: {choice}")
+
+    def update_camera_choice(self, choice):
+        try:
+            index = config.camera_list.index(choice)
+            config.camera_index = index
+            print(f"🎬 カメラ選択: {choice} (Index: {index})")
+        except ValueError:
+            pass
+
+    def toggle_mask(self):
+        config.mask_enabled = not config.mask_enabled
+        self.update_toggle_button_ui()
+        print("🎭 マスクON" if config.mask_enabled else "🙈 マスクOFF")
+
+    def update_toggle_button_ui(self):
+        if config.mask_enabled:
+            self.btn_toggle.configure(text="マスクを無効にする", fg_color="#2d8659", hover_color="#236b47")
+        else:
+            self.btn_toggle.configure(text="マスクを有効にする", fg_color="#5a5a5a", hover_color="#4a4a4a")
+
+    def update_scale(self, val):
+        config.scale = val
+        self.label_scale.configure(text=f"マスクの大きさ: {config.scale:.1f}")
+
+    def update_smooth(self, val):
+        config.smooth_frames = int(val)
+        self.label_smooth.configure(text=f"動きの滑らかさ: {config.smooth_frames}")
+
+
+
+    def on_closing(self):
+        config.running = False
+        self.destroy()
+
+if __name__ == "__main__":
+    # カメラ処理を別スレッドで開始
+    thread = threading.Thread(target=camera_thread, daemon=True)
+    thread.start()
+
+    # GUIを開始
+    app = ControlApp()
+    app.mainloop()

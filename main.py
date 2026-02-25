@@ -471,23 +471,15 @@ class ControlApp(ctk.CTk):
         self.status_frame = ctk.CTkFrame(self)
         self.status_frame.pack(pady=5, padx=20, fill="x")
         
-        provider_display = "✅ GPU推論 (DirectML)" if "Dml" in config.provider_name else "⚠ CPU推論（低速）"
-        provider_color = "#2d8659" if "Dml" in config.provider_name else "#9e6b2b"
-        self.label_provider = ctk.CTkLabel(self.status_frame, text=provider_display, 
-                                           font=self.font_small, text_color=provider_color)
+        self.label_provider = ctk.CTkLabel(self.status_frame, text="⏳ 起動中...", 
+                                           font=self.font_small, text_color="#888888")
         self.label_provider.pack(pady=5)
+        
+        self.label_error = None
+        
+        # provider情報をポーリングで更新
+        self._poll_provider_status()
 
-        # 起動エラーがあれば表示
-        if config.startup_error == "virtualcam":
-            self.label_error = ctk.CTkLabel(self.status_frame, 
-                text="❌ OBS Virtual Cameraが見つかりません\nOBS Studioをインストールしてください", 
-                font=self.font_small, text_color="#e74c3c", wraplength=380)
-            self.label_error.pack(pady=5)
-        elif config.startup_error == "camera":
-            self.label_error = ctk.CTkLabel(self.status_frame, 
-                text="❌ カメラが見つかりません\nWebカメラを接続してください", 
-                font=self.font_small, text_color="#e74c3c", wraplength=380)
-            self.label_error.pack(pady=5)
 
         # --- カメラ選択エリア ---
         self.camera_frame = ctk.CTkFrame(self)
@@ -628,6 +620,34 @@ class ControlApp(ctk.CTk):
     def update_smooth(self, val):
         config.smooth_frames = int(val)
         self.label_smooth.configure(text=f"動きの滑らかさ: {config.smooth_frames}")
+
+    def _poll_provider_status(self):
+        """camera_threadのprovider情報が確定するまでポーリング"""
+        if config.provider_name:
+            # provider確定 → 表示更新
+            if "Dml" in config.provider_name:
+                self.label_provider.configure(text="✅ GPU推論 (DirectML)", text_color="#2d8659")
+            else:
+                self.label_provider.configure(text="⚠ CPU推論（低速）", text_color="#9e6b2b")
+            return
+        
+        if config.startup_error:
+            # エラー発生
+            self.label_provider.configure(text="⚠ CPU推論（低速）", text_color="#9e6b2b")
+            if config.startup_error == "virtualcam":
+                self.label_error = ctk.CTkLabel(self.status_frame, 
+                    text="❌ OBS Virtual Cameraが見つかりません\nOBS Studioをインストールしてください", 
+                    font=self.font_small, text_color="#e74c3c", wraplength=380)
+                self.label_error.pack(pady=5)
+            elif config.startup_error == "camera":
+                self.label_error = ctk.CTkLabel(self.status_frame, 
+                    text="❌ カメラが見つかりません\nWebカメラを接続してください", 
+                    font=self.font_small, text_color="#e74c3c", wraplength=380)
+                self.label_error.pack(pady=5)
+            return
+        
+        # まだ確定してない → 500ms後に再チェック
+        self.after(500, self._poll_provider_status)
 
     def on_closing(self):
         config.running = False

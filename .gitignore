@@ -17,6 +17,10 @@ mediapipe-env/
 yolov8-face/
 *.pt
 
+# Masks (keep folder via .gitkeep)
+masks/*
+!masks/.gitkeep
+
 # OS
 .DS_Store
 Thumbs.db

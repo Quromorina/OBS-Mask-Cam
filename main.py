@@ -19,7 +19,7 @@ cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
 
-overlay_img = cv2.imread("mask.png", cv2.IMREAD_UNCHANGED)
+overlay_img = cv2.imread("masks/mask.png", cv2.IMREAD_UNCHANGED)
 model = YOLO("yolov8n-face.pt")
 # デバイス自動選択（CUDA が使えなければ CPU にフォールバック）
 device = "cuda" if torch.cuda.is_available() else "cpu"

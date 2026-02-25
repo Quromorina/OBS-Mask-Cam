@@ -2,12 +2,21 @@ import cv2
 import numpy as np
 import pyvirtualcam
 from pyvirtualcam import PixelFormat
+import os
+import sys
+
+# EXE環境ではonnxruntimeのDLLパスを事前にPATHに追加
+if getattr(sys, 'frozen', False):
+    _ort_capi = os.path.join(sys._MEIPASS, 'onnxruntime', 'capi')
+    if os.path.isdir(_ort_capi):
+        os.environ['PATH'] = _ort_capi + os.pathsep + os.environ.get('PATH', '')
+        if hasattr(os, 'add_dll_directory'):
+            os.add_dll_directory(_ort_capi)
+
 import onnxruntime as ort
 import time
 import threading
 import customtkinter as ctk
-import os
-import sys
 import shutil
 from tkinter import filedialog
 from PIL import Image

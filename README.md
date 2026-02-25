@@ -9,7 +9,6 @@ AIがリアルタイムで顔を検出し、マスク画像を重ねてOBS Virtu
 
 - **リアルタイム顔検出** — YOLOv8ベースのAIモデル（ONNX）を使用
 - **GPU推論対応** — DirectMLにより NVIDIA / AMD / Intel どのGPUでも高速推論
-- **Python不要** — ビルド済みEXEをダウンロードするだけで使える
 - **マスク追加可能** — 好きな画像をマスクとして追加できる
 - **OBS Virtual Camera** — OBSやZoom、Discordなどに仮想カメラとして出力
 

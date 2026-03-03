@@ -545,11 +545,7 @@ class ControlApp(ctk.CTk):
         self.slider_scale.set(config.scale)
         self.slider_scale.pack(padx=20, pady=(0, 10), fill="x")
 
-        self.label_smooth = ctk.CTkLabel(self.settings_frame, text=f"動きの滑らかさ: {config.smooth_frames}", font=self.font_main)
-        self.label_smooth.pack(pady=(10, 0))
-        self.slider_smooth = ctk.CTkSlider(self.settings_frame, from_=1, to=20, number_of_steps=19, command=self.update_smooth)
-        self.slider_smooth.set(config.smooth_frames)
-        self.slider_smooth.pack(padx=20, pady=(0, 20), fill="x")
+
 
         # 終了ボタン
         self.btn_quit = ctk.CTkButton(self, text="アプリを終了", height=40, font=self.font_bold, fg_color="#9e2b2b", hover_color="#7a2222", command=self.on_closing)
@@ -633,9 +629,7 @@ class ControlApp(ctk.CTk):
         config.scale = val
         self.label_scale.configure(text=f"マスクの大きさ: {config.scale:.1f}")
 
-    def update_smooth(self, val):
-        config.smooth_frames = int(val)
-        self.label_smooth.configure(text=f"動きの滑らかさ: {config.smooth_frames}")
+
 
     def _poll_provider_status(self):
         """camera_threadのprovider情報が確定するまでポーリング"""

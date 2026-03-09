@@ -28,11 +28,11 @@ AIがリアルタイムで顔を検出し、マスク画像を重ねてOBS Virtu
 
 ## 🚀 使い方
 
-### EXE版（推奨）
+### インストーラー版（推奨）
 
-1. [Releases](https://github.com/Quromorina/OBS-Mask-Cam/releases) から最新の `OBSMaskCam.zip` をダウンロード
-2. ZIPを解凍
-3. `OBSMaskCam.exe` をダブルクリック
+1. [Releases](https://github.com/Quromorina/OBS-Mask-Cam/releases/latest) から最新のインストーラー `OBSMaskCam_Setup_v1.0.0.exe` をダウンロード
+2. ダウンロードした `exe` をダブルクリックしてインストール
+3. スタートメニューまたはデスクトップのショートカットから `OBS Mask Cam` を起動
 4. **OBS Studio** を起動し、ソースに「映像キャプチャデバイス」→「OBS Virtual Camera」を選択
 
 ### Python版（開発者向け）

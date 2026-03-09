@@ -53,10 +53,12 @@ if IS_FROZEN:
 else:
     # 通常のPython実行
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
-    BUNDLE_DIR = APP_DIR
-
 MODEL_PATH = os.path.join(BUNDLE_DIR, "yolov8n-face.onnx")
-MASK_DIR = os.path.join(APP_DIR, "masks")
+
+# 共有データ（ユーザーごとのAppData\Roamingに保存）
+USER_DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "OBSMaskCam")
+MASK_DIR = os.path.join(USER_DATA_DIR, "masks")
+APP_MASK_DIR = os.path.join(APP_DIR, "masks")
 
 print(f"📁 APP_DIR: {APP_DIR}")
 print(f"📁 BUNDLE_DIR: {BUNDLE_DIR}")
@@ -77,6 +79,7 @@ class AppConfig:
     need_reload_list = False
     camera_index = 0
     camera_list = []
+    camera_mapping = {}          # カメラ名 -> システムIndexの対応
     provider_name = ""           # GPU/CPU表示用
     startup_error = ""           # 起動時エラーメッセージ
 
@@ -84,54 +87,80 @@ config = AppConfig()
 
 # --- カメラ検出 ---
 def get_camera_list():
+    input_names = []
+    mapping = {}
     if HAS_PYGRABBER:
         try:
             graph = FilterGraph()
-            return graph.get_input_devices()
+            devices = graph.get_input_devices()
+            for i, name in enumerate(devices):
+                if "OBS Virtual Camera" not in name:
+                    input_names.append(name)
+                    mapping[name] = i
+            return input_names if input_names else ["0"], mapping if input_names else {"0": 0}
         except Exception:
-            return ["0"]
+            return ["0"], {"0": 0}
     else:
         # フォールバック: OpenCVでの簡易スキャン
         available = []
+        mapping = {}
         for i in range(5):
             cap = cv2.VideoCapture(i, cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
             if cap.isOpened():
-                available.append(str(i))
+                name = str(i)
+                available.append(name)
+                mapping[name] = i
                 cap.release()
-        return available if available else ["0"]
+        return available if available else ["0"], mapping if mapping else {"0": 0}
 
-config.camera_list = get_camera_list()
+config.camera_list, config.camera_mapping = get_camera_list()
+if len(config.camera_list) > 0:
+    config.camera_index = config.camera_mapping.get(config.camera_list[0], 0)
+else:
+    config.camera_index = 0
 
 # --- フォルダ準備＆デフォルトマスク初期化 ---
 if not os.path.exists(MASK_DIR):
-    os.makedirs(MASK_DIR)
+    os.makedirs(MASK_DIR, exist_ok=True)
     print(f"📁 masksフォルダ作成: {MASK_DIR}")
-
-# masksフォルダ内に画像が1つもない場合、モザイクマスクを自動生成
-def _generate_default_mask():
-    """デフォルトのモザイクパターンマスクを生成"""
-    size = 256
-    img = np.zeros((size, size, 4), dtype=np.uint8)
-    block = 16
-    rng = np.random.RandomState(42)  # 再現性のため固定シード
-    for y in range(0, size, block):
-        for x in range(0, size, block):
-            c = rng.randint(60, 200)
-            img[y:y+block, x:x+block] = (c, c, c, 220)
-    path = os.path.join(MASK_DIR, "mosaic.png")
-    imwrite_safe(path, img)
-    print(f"🎭 デフォルトモザイクマスク生成: {path}")
-    return "mosaic.png"
+    if os.path.exists(APP_MASK_DIR):
+        for f in os.listdir(APP_MASK_DIR):
+            src_file = os.path.join(APP_MASK_DIR, f)
+            if os.path.isfile(src_file):
+                try:
+                    shutil.copy2(src_file, MASK_DIR)
+                except Exception as e:
+                    print(f"初期マスクのコピー失敗: {e}")
 
 def get_mask_list():
     files = [f for f in os.listdir(MASK_DIR) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp'))]
     return files
 
+# 古いモザイク画像の削除（非推奨化）
+old_mosaic_path = os.path.join(MASK_DIR, "mosaic.png")
+if os.path.exists(old_mosaic_path):
+    try:
+        os.remove(old_mosaic_path)
+    except Exception:
+        pass
+
+# icon.png が MASK_DIR になければコピーして生成
+dest_icon_path = os.path.join(MASK_DIR, "icon.png")
+if not os.path.exists(dest_icon_path):
+    app_icon_path = os.path.join(APP_DIR, "icon.png")
+    if not os.path.exists(app_icon_path):
+        app_icon_path = os.path.join(APP_DIR, "icon.ico")
+    if not os.path.exists(app_icon_path):
+        app_icon_path = os.path.join(BUNDLE_DIR, "icon.ico")
+    try:
+        if os.path.exists(app_icon_path):
+            img = Image.open(app_icon_path)
+            img.save(dest_icon_path, "PNG")
+            print(f"🎭 デフォルトマスク（アイコン）生成: {dest_icon_path}")
+    except Exception as e:
+        print(f"デフォルトマスク生成エラー: {e}")
+
 config.mask_files = get_mask_list()
-if not config.mask_files:
-    # マスクが1つもない → デフォルト生成
-    default_name = _generate_default_mask()
-    config.mask_files = get_mask_list()
 
 if config.mask_files:
     config.current_mask_name = config.mask_files[0]
@@ -417,15 +446,19 @@ def camera_thread():
                     history = data["history"]
                     current_history = history[-config.smooth_frames:]
                     
-                    # 適応的スムージング: 速い動きの時は即追従
+                    # 適応的スムージング: 速い動きの時は即追従 (XY軸)
                     if len(current_history) >= 2:
                         dx = abs(current_history[-1][0] - current_history[-2][0])
                         dy = abs(current_history[-1][1] - current_history[-2][1])
                         move_dist = np.sqrt(dx**2 + dy**2)
+                        
                         # 顔サイズに対する移動量の比率で判定
                         face_ref = max(current_history[-1][2], 1)
                         move_ratio = move_dist / face_ref
-                        if move_ratio > 0.3:  # 顔サイズの30%以上移動
+                        ds = abs(current_history[-1][2] - current_history[-2][2])
+                        scale_ratio = ds / face_ref
+
+                        if move_ratio > 0.25 or scale_ratio > 0.08:  # しきい値を下げてより機敏に
                             # 最新2フレームだけで平均（即追従）
                             use_hist = current_history[-2:]
                         else:
@@ -436,15 +469,17 @@ def camera_thread():
                     avg_cx = int(np.mean([h[0] for h in use_hist]))
                     avg_cy = int(np.mean([h[1] for h in use_hist]))
                     
-                    # サイズも適応的スムージング
+                    # サイズ(Z軸)も適応的スムージング：変化に敏感にする
                     sizes = [h[2] for h in current_history]
                     latest_fs = sizes[-1]
                     if len(sizes) >= 2:
                         size_change_ratio = abs(sizes[-1] - sizes[-2]) / max(sizes[-2], 1)
-                        if size_change_ratio > 0.15:
-                            avg_fs = int(np.mean(sizes[-2:]))
+                        if size_change_ratio > 0.05: # 5%以上の変化でもう追従
+                            avg_fs = int((sizes[-1] * 2 + sizes[-2]) / 3) # 最新の重みを高く
                         else:
-                            avg_fs = int(np.mean(sizes))
+                            # 変化が少ない場合でも最新寄りに
+                            weights = np.linspace(0.5, 1.5, len(sizes))
+                            avg_fs = int(np.average(sizes, weights=weights))
                     else:
                         avg_fs = latest_fs
 
@@ -506,10 +541,12 @@ class ControlApp(ctk.CTk):
         
         self.option_camera = ctk.CTkOptionMenu(self.camera_frame, values=config.camera_list, 
                                                font=self.font_main, command=self.update_camera_choice)
-        if config.camera_index < len(config.camera_list):
-            self.option_camera.set(config.camera_list[config.camera_index])
-        else:
-            self.option_camera.set(config.camera_list[0])
+        current_name = config.camera_list[0] if config.camera_list else "0"
+        for name, idx in config.camera_mapping.items():
+            if idx == config.camera_index:
+                current_name = name
+                break
+        self.option_camera.set(current_name)
         self.option_camera.pack(side="right", padx=10, pady=10)
 
         # --- プレビューエリア ---
@@ -607,12 +644,9 @@ class ControlApp(ctk.CTk):
         print(f"🎭 マスク切り替え: {choice}")
 
     def update_camera_choice(self, choice):
-        try:
-            index = config.camera_list.index(choice)
-            config.camera_index = index
-            print(f"🎬 カメラ選択: {choice} (Index: {index})")
-        except ValueError:
-            pass
+        if choice in config.camera_mapping:
+            config.camera_index = config.camera_mapping[choice]
+            print(f"🎬 カメラ選択: {choice} (Index: {config.camera_index})")
 
     def toggle_mask(self):
         config.mask_enabled = not config.mask_enabled

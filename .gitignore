@@ -23,3 +23,6 @@ masks/*
 # OS
 .DS_Store
 Thumbs.db
+
+InnoSetup_Output/
+build_log*.txt

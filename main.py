@@ -18,7 +18,7 @@ import time
 import threading
 import customtkinter as ctk
 import shutil
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 from PIL import Image
 try:
     from pygrabber.dshow_graph import FilterGraph
@@ -358,11 +358,22 @@ def camera_thread():
             # カメラソースの切り替えチェック
             if last_camera_index != config.camera_index:
                 print(f"🔄 カメラ切り替え中: Index {config.camera_index}")
+                
+                # スムーズな切り替えのため、一旦ダミー画面を出力
+                frame = np.zeros((config.height, config.width, 3), dtype=np.uint8)
+                cv2.putText(frame, "Switching Camera...", (config.width//4, config.height//2),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 2)
+                cam.send(frame)
+                cam.sleep_until_next_frame()
+                
                 cap.release()
+                time.sleep(0.5) # リソース解放を待機
+                
                 cap = cv2.VideoCapture(config.camera_index, cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.width)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.height)
                 last_camera_index = config.camera_index
+                continue
 
             # マスクリストの更新チェック
             if config.need_reload_list:
@@ -564,7 +575,10 @@ class ControlApp(ctk.CTk):
         self.option_mask.pack(pady=5)
 
         self.btn_add_mask = ctk.CTkButton(self, text="➕ 新しいマスクを追加", font=self.font_main, fg_color="#2b719e", command=self.add_mask_file)
-        self.btn_add_mask.pack(pady=5)
+        self.btn_add_mask.pack(pady=(5, 5))
+
+        self.btn_del_mask = ctk.CTkButton(self, text="🗑️ 選択中のマスクを削除", font=self.font_main, fg_color="#7a2b2b", hover_color="#5a1818", command=self.delete_mask_file)
+        self.btn_del_mask.pack(pady=(0, 5))
 
         # --- マスクON/OFF 大ボタン ---
         self.btn_toggle = ctk.CTkButton(self, text="マスクを無効にする", height=60, font=self.font_button,
@@ -637,6 +651,35 @@ class ControlApp(ctk.CTk):
                 self.update_mask_choice(new_file_name)
             except Exception as e:
                 print(f"Error adding file: {e}")
+
+    def delete_mask_file(self):
+        current = config.current_mask_name
+        if not current:
+            return
+        if current == "icon.png":
+            messagebox.showwarning("削除不可", "デフォルトのアイコン画像は削除できません。")
+            return
+            
+        if messagebox.askyesno("削除の確認", f"マスク画像「{current}」を削除してもよろしいですか？\n削除された画像は元に戻せません。"):
+            try:
+                path = os.path.join(MASK_DIR, current)
+                if os.path.exists(path):
+                    os.remove(path)
+                    print(f"🗑️ マスクを削除しました: {current}")
+                    
+                    config.need_reload_list = True
+                    time.sleep(0.1)
+                    new_list = get_mask_list()
+                    self.option_mask.configure(values=new_list)
+                    if new_list:
+                        new_choice = new_list[0]
+                        self.option_mask.set(new_choice)
+                        self.update_mask_choice(new_choice)
+                    else:
+                        self.option_mask.set("")
+                        self.update_mask_choice("")
+            except Exception as e:
+                messagebox.showerror("エラー", f"削除に失敗しました: {e}")
 
     def update_mask_choice(self, choice):
         config.current_mask_name = choice

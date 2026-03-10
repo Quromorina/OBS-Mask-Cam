@@ -6,7 +6,7 @@ AppId={{867FE60D-D57B-4929-B583-05562BB7AEDC}}
 ; アプリケーション情報
 AppName=OBS Mask Cam
 AppVersion=1.0.0
-AppPublisher=Quromorina
+AppPublisher=OBS Mask Cam Project
 ; デフォルトのインストール先 (Program Files配下)
 DefaultDirName={autopf}\OBSMaskCam
 ; スタートメニューのフォルダ名

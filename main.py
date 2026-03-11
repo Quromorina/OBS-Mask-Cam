@@ -635,6 +635,16 @@ class ControlApp(ctk.CTk):
                 elif img.shape[2] == 3: # BGR
                     img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
                 
+                # --- 画像が巨大すぎる場合は縮小する ---
+                MAX_MASK_SIZE = 1000
+                h, w = img.shape[:2]
+                if max(h, w) > MAX_MASK_SIZE:
+                    scale_ratio = MAX_MASK_SIZE / float(max(h, w))
+                    new_w = int(w * scale_ratio)
+                    new_h = int(h * scale_ratio)
+                    img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    print(f"ℹ️ 画像が大きすぎるため、{new_w}x{new_h} に最適化して保存します。")
+                
                 # ファイル名を強制的に .png に変更して保存
                 base_name = os.path.splitext(os.path.basename(file_path))[0]
                 new_file_name = f"{base_name}.png"
@@ -698,9 +708,9 @@ class ControlApp(ctk.CTk):
 
     def update_toggle_button_ui(self):
         if config.mask_enabled:
-            self.btn_toggle.configure(text="マスクを無効にする", fg_color="#2d8659", hover_color="#236b47")
+            self.btn_toggle.configure(text="マスクを無効にする", fg_color="#2d8659", hover_color="#4a4a4a")
         else:
-            self.btn_toggle.configure(text="マスクを有効にする", fg_color="#5a5a5a", hover_color="#4a4a4a")
+            self.btn_toggle.configure(text="マスクを有効にする", fg_color="#5a5a5a", hover_color="#236b47")
 
     def update_scale(self, val):
         config.scale = val

@@ -119,9 +119,9 @@ class AppConfig:
     tile_detection = True
     yunet_max_side = 960
     use_external_tracker = True
-    smooth_frames = 5
+    smooth_frames = 3
     distance_threshold = 50
-    track_hold_seconds = 0.25
+    track_hold_seconds = 0.12
     next_face_id = 1
     running = True
     current_mask_name = ""
@@ -687,10 +687,62 @@ def update_face_tracks_with_bytetrack(boxes, scores, tracker, face_history, now)
         new_face_history[fid] = {"history": history, "last_update": now}
 
     for fid, data in face_history.items():
-        if fid not in new_face_history and now - data["last_update"] <= config.track_hold_seconds:
+        if fid in new_face_history or now - data["last_update"] > config.track_hold_seconds:
+            continue
+        ghost_cx, ghost_cy, ghost_fs = data["history"][-1]
+        near_fresh_track = any(
+            np.hypot(fresh["history"][-1][0] - ghost_cx, fresh["history"][-1][1] - ghost_cy)
+            < max(config.distance_threshold, ghost_fs * 0.9)
+            for fresh in new_face_history.values()
+        )
+        if not near_fresh_track:
             new_face_history[fid] = data
 
     return new_face_history
+
+def smoothed_mask_pose(history):
+    if not history:
+        return None
+
+    current_history = history[-config.smooth_frames:]
+    latest_cx, latest_cy, latest_fs = current_history[-1]
+
+    if len(current_history) >= 2:
+        prev_cx, prev_cy, prev_fs = current_history[-2]
+        first_cx, first_cy, _ = current_history[0]
+        face_ref = max(latest_fs, 1)
+        frame_move = float(np.hypot(latest_cx - prev_cx, latest_cy - prev_cy)) / face_ref
+        span_move = float(np.hypot(latest_cx - first_cx, latest_cy - first_cy)) / face_ref
+
+        if frame_move > 0.10 or span_move > 0.18:
+            xy_hist = current_history[-1:]
+        elif frame_move > 0.05:
+            xy_hist = current_history[-2:]
+        else:
+            xy_hist = current_history
+    else:
+        xy_hist = current_history
+
+    if len(xy_hist) == 1:
+        avg_cx, avg_cy = int(xy_hist[-1][0]), int(xy_hist[-1][1])
+    else:
+        weights = np.linspace(0.35, 1.0, len(xy_hist))
+        avg_cx = int(np.average([h[0] for h in xy_hist], weights=weights))
+        avg_cy = int(np.average([h[1] for h in xy_hist], weights=weights))
+
+    sizes = [h[2] for h in current_history]
+    latest_fs = sizes[-1]
+    if len(sizes) >= 2:
+        size_change_ratio = abs(sizes[-1] - sizes[-2]) / max(sizes[-2], 1)
+        if size_change_ratio > 0.04:
+            avg_fs = int(sizes[-1] * 0.75 + sizes[-2] * 0.25)
+        else:
+            weights = np.linspace(0.5, 1.5, len(sizes))
+            avg_fs = int(np.average(sizes, weights=weights))
+    else:
+        avg_fs = latest_fs
+
+    return avg_cx, avg_cy, max(1, avg_fs)
 
 # --- アルファ合成 ---
 def overlay_transparent(background, overlay, x, y):
@@ -835,45 +887,10 @@ def camera_thread():
 
             if config.mask_enabled and overlay_img is not None:
                 for fid, data in face_history.items():
-                    history = data["history"]
-                    current_history = history[-config.smooth_frames:]
-                    
-                    # 適応的スムージング: 速い動きの時は即追従 (XY軸)
-                    if len(current_history) >= 2:
-                        dx = abs(current_history[-1][0] - current_history[-2][0])
-                        dy = abs(current_history[-1][1] - current_history[-2][1])
-                        move_dist = np.sqrt(dx**2 + dy**2)
-                        
-                        # 顔サイズに対する移動量の比率で判定
-                        face_ref = max(current_history[-1][2], 1)
-                        move_ratio = move_dist / face_ref
-                        ds = abs(current_history[-1][2] - current_history[-2][2])
-                        scale_ratio = ds / face_ref
-
-                        if move_ratio > 0.25 or scale_ratio > 0.08:  # しきい値を下げてより機敏に
-                            # 最新2フレームだけで平均（即追従）
-                            use_hist = current_history[-2:]
-                        else:
-                            use_hist = current_history
-                    else:
-                        use_hist = current_history
-                    
-                    avg_cx = int(np.mean([h[0] for h in use_hist]))
-                    avg_cy = int(np.mean([h[1] for h in use_hist]))
-                    
-                    # サイズ(Z軸)も適応的スムージング：変化に敏感にする
-                    sizes = [h[2] for h in current_history]
-                    latest_fs = sizes[-1]
-                    if len(sizes) >= 2:
-                        size_change_ratio = abs(sizes[-1] - sizes[-2]) / max(sizes[-2], 1)
-                        if size_change_ratio > 0.05: # 5%以上の変化でもう追従
-                            avg_fs = int((sizes[-1] * 2 + sizes[-2]) / 3) # 最新の重みを高く
-                        else:
-                            # 変化が少ない場合でも最新寄りに
-                            weights = np.linspace(0.5, 1.5, len(sizes))
-                            avg_fs = int(np.average(sizes, weights=weights))
-                    else:
-                        avg_fs = latest_fs
+                    pose = smoothed_mask_pose(data["history"])
+                    if pose is None:
+                        continue
+                    avg_cx, avg_cy, avg_fs = pose
 
                     try:
                         mask_size = max(1, int(round(avg_fs / 4) * 4))

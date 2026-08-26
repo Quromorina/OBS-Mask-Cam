@@ -51,16 +51,13 @@ def main():
     args = parser.parse_args()
 
     os.environ["OBS_MASK_CAM_DETECTOR"] = args.detector
-    os.environ.setdefault("APPDATA", tempfile.gettempdir())
+    os.environ["APPDATA"] = os.path.join(tempfile.gettempdir(), "OBSMaskCamRenderAppData")
 
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     sys.path.insert(0, repo_root)
     import main as app
 
     app.config.scale = args.scale
-    detector = app.create_face_detector()
-    tracker = app.create_external_tracker()
-    face_history = {}
 
     input_path, _ = ascii_path(os.path.abspath(args.input), "obs_mask_cam_input.mp4")
     cap = cv2.VideoCapture(input_path)
@@ -73,6 +70,11 @@ def main():
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if args.max_frames > 0:
         total = min(total, args.max_frames)
+    app.config.fps = fps
+
+    detector = app.create_face_detector()
+    tracker = app.create_external_tracker()
+    face_history = {}
 
     out_abs = os.path.abspath(args.output)
     os.makedirs(os.path.dirname(out_abs), exist_ok=True)
@@ -95,15 +97,15 @@ def main():
         if not ok:
             break
 
-        now = time.time()
+        now = frame_idx / fps
         boxes, scores = detector.detect(frame)
         face_history = app.update_face_tracks_with_bytetrack(boxes, scores, tracker, face_history, now)
 
         for data in face_history.values():
-            history = data["history"][-app.config.smooth_frames:]
-            avg_cx = int(np.mean([h[0] for h in history]))
-            avg_cy = int(np.mean([h[1] for h in history]))
-            avg_fs = int(np.mean([h[2] for h in history]))
+            pose = app.smoothed_mask_pose(data["history"])
+            if pose is None:
+                continue
+            avg_cx, avg_cy, avg_fs = pose
             mask_size = max(1, int(round(avg_fs / 4) * 4))
             if mask_size not in resized_cache:
                 if len(resized_cache) > 64:

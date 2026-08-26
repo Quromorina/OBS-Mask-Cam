@@ -917,7 +917,8 @@ class ControlApp(ctk.CTk):
         super().__init__()
 
         self.title("OBS Mask Cam - コントロールパネル")
-        self.geometry("450x850")
+        self.geometry("450x760")
+        self.minsize(340, 420)
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
@@ -925,16 +926,24 @@ class ControlApp(ctk.CTk):
         self.font_main = ("MS Gothic", 12)
         self.font_bold = ("MS Gothic", 14, "bold")
         self.font_title = ("MS Gothic", 24, "bold")
+        self.font_title_compact = ("MS Gothic", 20, "bold")
         self.font_button = ("MS Gothic", 18, "bold")
+        self.font_button_compact = ("MS Gothic", 15, "bold")
         self.font_small = ("MS Gothic", 10)
+        self.preview_size = 190
+
+        self.content = ctk.CTkScrollableFrame(self, fg_color="transparent", corner_radius=0)
+        self.content.pack(fill="both", expand=True)
+        self.content.grid_columnconfigure(0, weight=1)
+        parent = self.content
 
         # タイトル
-        self.label_title = ctk.CTkLabel(self, text="🎭 OBS Mask Cam", font=self.font_title)
-        self.label_title.pack(pady=15)
+        self.label_title = ctk.CTkLabel(parent, text="🎭 OBS Mask Cam", font=self.font_title)
+        self.label_title.pack(pady=(14, 10))
 
         # --- ステータス表示 ---
-        self.status_frame = ctk.CTkFrame(self)
-        self.status_frame.pack(pady=5, padx=20, fill="x")
+        self.status_frame = ctk.CTkFrame(parent)
+        self.status_frame.pack(pady=5, padx=18, fill="x")
         
         self.label_provider = ctk.CTkLabel(self.status_frame, text="⏳ 起動中...", 
                                            font=self.font_small, text_color="#888888")
@@ -947,51 +956,53 @@ class ControlApp(ctk.CTk):
 
 
         # --- カメラ選択エリア ---
-        self.camera_frame = ctk.CTkFrame(self)
-        self.camera_frame.pack(pady=10, padx=20, fill="x")
+        self.camera_frame = ctk.CTkFrame(parent)
+        self.camera_frame.pack(pady=8, padx=18, fill="x")
+        self.camera_frame.grid_columnconfigure(1, weight=1)
         
         self.label_camera = ctk.CTkLabel(self.camera_frame, text="映像ソース (カメラ):", font=self.font_bold)
-        self.label_camera.pack(side="left", padx=10, pady=10)
+        self.label_camera.grid(row=0, column=0, padx=10, pady=10, sticky="w")
         
         self.option_camera = ctk.CTkOptionMenu(self.camera_frame, values=config.camera_list, 
-                                               font=self.font_main, command=self.update_camera_choice)
+                                               font=self.font_main, command=self.update_camera_choice, width=170)
         current_name = config.camera_list[0] if config.camera_list else "0"
         for name, idx in config.camera_mapping.items():
             if idx == config.camera_index:
                 current_name = name
                 break
         self.option_camera.set(current_name)
-        self.option_camera.pack(side="right", padx=10, pady=10)
+        self.option_camera.grid(row=0, column=1, padx=10, pady=10, sticky="e")
 
         # --- プレビューエリア ---
-        self.preview_frame = ctk.CTkFrame(self, width=200, height=200)
-        self.preview_frame.pack(pady=10)
+        self.preview_frame = ctk.CTkFrame(parent, width=self.preview_size, height=self.preview_size)
+        self.preview_frame.pack(pady=8)
+        self.preview_frame.pack_propagate(False)
         self.preview_label = ctk.CTkLabel(self.preview_frame, text="画像なし", font=self.font_main)
         self.preview_label.place(relx=0.5, rely=0.5, anchor="center")
         
         # --- マスク選択・追加 ---
-        self.label_mask_choice = ctk.CTkLabel(self, text="使用するマスク選択:", font=self.font_bold)
-        self.label_mask_choice.pack(pady=(10, 0))
+        self.label_mask_choice = ctk.CTkLabel(parent, text="使用するマスク選択:", font=self.font_bold)
+        self.label_mask_choice.pack(pady=(8, 0))
         
-        self.option_mask = ctk.CTkOptionMenu(self, values=config.mask_files, font=self.font_main, dropdown_font=self.font_main, command=self.update_mask_choice)
+        self.option_mask = ctk.CTkOptionMenu(parent, values=config.mask_files, font=self.font_main, dropdown_font=self.font_main, command=self.update_mask_choice, width=170)
         self.option_mask.set(config.current_mask_name)
         self.option_mask.pack(pady=5)
 
-        self.btn_add_mask = ctk.CTkButton(self, text="➕ 新しいマスクを追加", font=self.font_main, fg_color="#2b719e", command=self.add_mask_file)
+        self.btn_add_mask = ctk.CTkButton(parent, text="➕ 新しいマスクを追加", font=self.font_main, fg_color="#2b719e", command=self.add_mask_file)
         self.btn_add_mask.pack(pady=(5, 5))
 
-        self.btn_del_mask = ctk.CTkButton(self, text="🗑️ 選択中のマスクを削除", font=self.font_main, fg_color="#7a2b2b", hover_color="#5a1818", command=self.delete_mask_file)
+        self.btn_del_mask = ctk.CTkButton(parent, text="🗑️ 選択中のマスクを削除", font=self.font_main, fg_color="#7a2b2b", hover_color="#5a1818", command=self.delete_mask_file)
         self.btn_del_mask.pack(pady=(0, 5))
 
         # --- マスクON/OFF 大ボタン ---
-        self.btn_toggle = ctk.CTkButton(self, text="マスクを無効にする", height=60, font=self.font_button,
+        self.btn_toggle = ctk.CTkButton(parent, text="マスクを無効にする", height=54, font=self.font_button,
                                         fg_color="#2d8659", hover_color="#236b47", command=self.toggle_mask)
-        self.btn_toggle.pack(pady=20, padx=40, fill="x")
+        self.btn_toggle.pack(pady=16, padx=34, fill="x")
         self.update_toggle_button_ui()
 
         # --- 設定エリア ---
-        self.settings_frame = ctk.CTkFrame(self)
-        self.settings_frame.pack(pady=10, padx=20, fill="x")
+        self.settings_frame = ctk.CTkFrame(parent)
+        self.settings_frame.pack(pady=8, padx=18, fill="x")
 
         self.label_scale = ctk.CTkLabel(self.settings_frame, text=f"マスクの大きさ: {config.scale:.1f}", font=self.font_main)
         self.label_scale.pack(pady=(10, 0))
@@ -1002,11 +1013,68 @@ class ControlApp(ctk.CTk):
 
 
         # 終了ボタン
-        self.btn_quit = ctk.CTkButton(self, text="アプリを終了", height=40, font=self.font_bold, fg_color="#9e2b2b", hover_color="#7a2222", command=self.on_closing)
-        self.btn_quit.pack(pady=(20, 30))
+        self.btn_quit = ctk.CTkButton(parent, text="アプリを終了", height=38, font=self.font_bold, fg_color="#9e2b2b", hover_color="#7a2222", command=self.on_closing)
+        self.btn_quit.pack(pady=(14, 22))
 
         self.update_preview()
+        self.bind("<Configure>", self._on_window_resize)
+        self._apply_responsive_layout()
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def _on_window_resize(self, event):
+        if event.widget is self:
+            self._apply_responsive_layout()
+
+    def _apply_responsive_layout(self):
+        width = max(self.winfo_width(), 340)
+        height = max(self.winfo_height(), 420)
+        narrow = width < 420
+        compact = height < 700
+        very_compact = height < 560
+
+        title_font = self.font_title_compact if compact or narrow else self.font_title
+        button_font = self.font_button_compact if compact or narrow else self.font_button
+        preview_size = 112 if very_compact else 148 if compact else 190
+        frame_padx = 10 if narrow else 18
+        button_padx = 18 if narrow else 34
+        title_pad = (8, 6) if compact else (14, 10)
+        block_pady = 4 if compact else 8
+
+        self.label_title.configure(font=title_font)
+        self.label_title.pack_configure(pady=title_pad)
+        self.status_frame.pack_configure(pady=(3 if compact else 5), padx=frame_padx)
+        self.camera_frame.pack_configure(pady=block_pady, padx=frame_padx)
+        self.settings_frame.pack_configure(pady=block_pady, padx=frame_padx)
+        self.preview_frame.pack_configure(pady=block_pady)
+        self.label_mask_choice.pack_configure(pady=((4 if compact else 8), 0))
+        self.btn_toggle.configure(height=(44 if compact else 54), font=button_font)
+        self.btn_toggle.pack_configure(pady=(10 if compact else 16), padx=button_padx)
+        self.btn_quit.configure(height=(34 if compact else 38))
+        self.btn_quit.pack_configure(pady=((10 if compact else 14), (14 if compact else 22)))
+
+        if narrow:
+            self.camera_frame.grid_columnconfigure(0, weight=1)
+            self.camera_frame.grid_columnconfigure(1, weight=0)
+            self.label_camera.grid_configure(row=0, column=0, padx=10, pady=(8, 2), sticky="w")
+            self.option_camera.grid_configure(row=1, column=0, padx=10, pady=(0, 8), sticky="ew")
+        else:
+            self.camera_frame.grid_columnconfigure(0, weight=0)
+            self.camera_frame.grid_columnconfigure(1, weight=1)
+            self.label_camera.grid_configure(row=0, column=0, padx=10, pady=10, sticky="w")
+            self.option_camera.grid_configure(row=0, column=1, padx=10, pady=10, sticky="e")
+
+        control_width = max(150, min(220, width - 90))
+        self.option_camera.configure(width=control_width)
+        self.option_mask.configure(width=control_width)
+        self.label_camera.configure(wraplength=max(180, width - 80))
+
+        if self.label_error is not None:
+            self.label_error.configure(wraplength=max(240, width - 80))
+
+        if preview_size != self.preview_size:
+            self.preview_size = preview_size
+            self.preview_frame.configure(width=preview_size, height=preview_size)
+            self.update_preview()
 
     def update_preview(self):
         try:
@@ -1014,13 +1082,17 @@ class ControlApp(ctk.CTk):
             if os.path.exists(path):
                 img = Image.open(path)
                 aspect = img.width / img.height
+                max_size = max(80, self.preview_size - 16)
                 if aspect > 1:
-                    w, h = 180, int(180 / aspect)
+                    w, h = max_size, int(max_size / aspect)
                 else:
-                    w, h = int(180 * aspect), 180
+                    w, h = int(max_size * aspect), max_size
                 
                 ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(w, h))
+                self.preview_image = ctk_img
                 self.preview_label.configure(image=ctk_img, text="")
+            else:
+                self.preview_label.configure(image=None, text="画像なし", font=self.font_main)
         except Exception as e:
             self.preview_label.configure(image=None, text="エラー", font=self.font_main)
             print(f"Preview error: {e}")

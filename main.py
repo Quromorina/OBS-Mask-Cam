@@ -1009,13 +1009,6 @@ class ControlApp(ctk.CTk):
         self.slider_scale = ctk.CTkSlider(self.settings_frame, from_=1.0, to=4.0, command=self.update_scale)
         self.slider_scale.set(config.scale)
         self.slider_scale.pack(padx=20, pady=(0, 10), fill="x")
-
-
-
-        # 終了ボタン
-        self.btn_quit = ctk.CTkButton(parent, text="アプリを終了", height=38, font=self.font_bold, fg_color="#9e2b2b", hover_color="#7a2222", command=self.on_closing)
-        self.btn_quit.pack(pady=(14, 22))
-
         self.update_preview()
         self.bind("<Configure>", self._on_window_resize)
         self._apply_responsive_layout()
@@ -1049,8 +1042,6 @@ class ControlApp(ctk.CTk):
         self.label_mask_choice.pack_configure(pady=((4 if compact else 8), 0))
         self.btn_toggle.configure(height=(44 if compact else 54), font=button_font)
         self.btn_toggle.pack_configure(pady=(10 if compact else 16), padx=button_padx)
-        self.btn_quit.configure(height=(34 if compact else 38))
-        self.btn_quit.pack_configure(pady=((10 if compact else 14), (14 if compact else 22)))
 
         if narrow:
             self.camera_frame.grid_columnconfigure(0, weight=1)

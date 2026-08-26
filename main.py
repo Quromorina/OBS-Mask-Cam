@@ -1,7 +1,13 @@
 import cv2
 import numpy as np
-import pyvirtualcam
-from pyvirtualcam import PixelFormat
+try:
+    import pyvirtualcam
+    from pyvirtualcam import PixelFormat
+    HAS_PYVIRTUALCAM = True
+except ImportError:
+    pyvirtualcam = None
+    PixelFormat = None
+    HAS_PYVIRTUALCAM = False
 import os
 import sys
 
@@ -16,10 +22,21 @@ if getattr(sys, 'frozen', False):
 import onnxruntime as ort
 import time
 import threading
-import customtkinter as ctk
+try:
+    import customtkinter as ctk
+    HAS_CUSTOMTKINTER = True
+except ImportError:
+    ctk = None
+    HAS_CUSTOMTKINTER = False
 import shutil
 from tkinter import filedialog, messagebox
 from PIL import Image
+try:
+    import supervision as sv
+    from trackers import ByteTrackTracker
+    HAS_BYTETRACK = True
+except ImportError:
+    HAS_BYTETRACK = False
 try:
     from pygrabber.dshow_graph import FilterGraph
     HAS_PYGRABBER = True
@@ -44,6 +61,21 @@ def imwrite_safe(path, img):
         return True
     return False
 
+def ascii_model_path(path):
+    """OpenCV DNNが日本語パスを読めない環境向けに、AppData側へモデルをキャッシュする"""
+    try:
+        path.encode("ascii")
+        return path
+    except UnicodeEncodeError:
+        pass
+
+    cache_dir = os.path.join(USER_DATA_DIR, "models")
+    os.makedirs(cache_dir, exist_ok=True)
+    cached = os.path.join(cache_dir, os.path.basename(path))
+    if not os.path.exists(cached) or os.path.getsize(cached) != os.path.getsize(path):
+        shutil.copy2(path, cached)
+    return cached
+
 # --- パス解決（EXE対応） ---
 IS_FROZEN = getattr(sys, 'frozen', False)
 if IS_FROZEN:
@@ -53,7 +85,12 @@ if IS_FROZEN:
 else:
     # 通常のPython実行
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BUNDLE_DIR, "yolov8n-face.onnx")
+    BUNDLE_DIR = APP_DIR
+MODEL_DIR = os.path.join(BUNDLE_DIR, "models")
+YOLO_MODEL_PATH = os.path.join(BUNDLE_DIR, "yolov8n-face.onnx")
+YUNET_MODEL_PATH = os.path.join(MODEL_DIR, "face_detection_yunet_2026may.onnx")
+SCRFD_MODEL_PATH = os.path.join(MODEL_DIR, "scrfd_2.5g_kps.onnx")
+MODEL_PATH = YOLO_MODEL_PATH
 
 # 共有データ（ユーザーごとのAppData\Roamingに保存）
 USER_DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "OBSMaskCam")
@@ -63,6 +100,8 @@ APP_MASK_DIR = os.path.join(APP_DIR, "masks")
 print(f"📁 APP_DIR: {APP_DIR}")
 print(f"📁 BUNDLE_DIR: {BUNDLE_DIR}")
 print(f"📁 MODEL_PATH: {MODEL_PATH} (exists: {os.path.exists(MODEL_PATH)})")
+print(f"📁 YUNET_MODEL_PATH: {YUNET_MODEL_PATH} (exists: {os.path.exists(YUNET_MODEL_PATH)})")
+print(f"📁 SCRFD_MODEL_PATH: {SCRFD_MODEL_PATH} (exists: {os.path.exists(SCRFD_MODEL_PATH)})")
 print(f"📁 MASK_DIR: {MASK_DIR}")
 
 # --- 設定（初期値） ---
@@ -71,8 +110,19 @@ class AppConfig:
     scale = 1.8
     mask_enabled = True
     infer_interval = 0.01  # 固定値: 10ms
+    detector_backend = os.environ.get("OBS_MASK_CAM_DETECTOR", "scrfd").lower()
+    model_input_size = 640
+    conf_threshold = 0.35
+    iou_threshold = 0.45
+    max_candidates = 300
+    max_faces = 20
+    tile_detection = True
+    yunet_max_side = 960
+    use_external_tracker = True
     smooth_frames = 5
     distance_threshold = 50
+    track_hold_seconds = 0.25
+    next_face_id = 1
     running = True
     current_mask_name = ""
     mask_files = []
@@ -186,7 +236,7 @@ def create_onnx_session(model_path):
     return session
 
 def preprocess(frame, input_size=640):
-    """フレームをONNX入力形式にリサイズ＆正規化"""
+    """YOLOv8のletterbox前処理。中央パディングで遠景・端の顔の座標ズレを抑える"""
     h, w = frame.shape[:2]
     scale = min(input_size / w, input_size / h)
     new_w, new_h = int(w * scale), int(h * scale)
@@ -194,12 +244,15 @@ def preprocess(frame, input_size=640):
     
     # パディングして正方形に
     padded = np.full((input_size, input_size, 3), 114, dtype=np.uint8)
-    padded[:new_h, :new_w] = resized
+    pad_x = (input_size - new_w) // 2
+    pad_y = (input_size - new_h) // 2
+    padded[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = resized
     
     # BGR→RGB, HWC→CHW, 正規化
-    blob = padded[:, :, ::-1].transpose(2, 0, 1).astype(np.float32) / 255.0
+    blob = padded[:, :, ::-1].transpose(2, 0, 1)
+    blob = np.ascontiguousarray(blob, dtype=np.float32) / 255.0
     blob = np.expand_dims(blob, axis=0)
-    return blob, scale, 0, 0  # pad_x, pad_y は0（左上寄せ）
+    return blob, scale, pad_x, pad_y
 
 def nms(boxes, scores, iou_threshold=0.45):
     """Non-Maximum Suppression"""
@@ -231,7 +284,9 @@ def nms(boxes, scores, iou_threshold=0.45):
     
     return keep
 
-def postprocess(output, scale, orig_w, orig_h, conf_threshold=0.5, iou_threshold=0.45):
+def postprocess(output, scale, pad_x, pad_y, orig_w, orig_h,
+                conf_threshold=0.35, iou_threshold=0.45,
+                max_candidates=300, max_faces=20, return_scores=False):
     """YOLOv8出力を処理して顔バウンディングボックスを返す"""
     # output shape: (1, 5, 8400) → transpose → (8400, 5) : [cx, cy, w, h, conf]
     predictions = output[0].transpose()
@@ -243,7 +298,14 @@ def postprocess(output, scale, orig_w, orig_h, conf_threshold=0.5, iou_threshold
     scores = scores[mask]
     
     if len(predictions) == 0:
+        if return_scores:
+            return np.empty((0, 4), dtype=int), np.empty((0,), dtype=np.float32)
         return []
+
+    if len(predictions) > max_candidates:
+        top_idx = np.argpartition(scores, -max_candidates)[-max_candidates:]
+        predictions = predictions[top_idx]
+        scores = scores[top_idx]
     
     # cx, cy, w, h → x1, y1, x2, y2
     cx, cy, w, h = predictions[:, 0], predictions[:, 1], predictions[:, 2], predictions[:, 3]
@@ -257,16 +319,378 @@ def postprocess(output, scale, orig_w, orig_h, conf_threshold=0.5, iou_threshold
     # NMS
     keep = nms(boxes, scores, iou_threshold)
     boxes = boxes[keep]
+    scores = scores[keep]
+
+    if len(boxes) > max_faces:
+        top_faces = scores.argsort()[::-1][:max_faces]
+        boxes = boxes[top_faces]
+        scores = scores[top_faces]
     
     # スケールを元画像サイズに戻す
-    boxes[:, [0, 2]] = boxes[:, [0, 2]] / scale
-    boxes[:, [1, 3]] = boxes[:, [1, 3]] / scale
+    boxes[:, [0, 2]] = (boxes[:, [0, 2]] - pad_x) / scale
+    boxes[:, [1, 3]] = (boxes[:, [1, 3]] - pad_y) / scale
     
     # クリッピング
     boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, orig_w)
     boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, orig_h)
     
+    boxes = boxes.astype(int)
+    if return_scores:
+        return boxes, scores.astype(np.float32)
+    return boxes
+
+def detect_faces(session, input_name, frame, use_tiling=False, return_scores=False):
+    """全体検出に2x2タイル検出を追加し、遠くの小さい顔も拾いやすくする"""
+    regions = [(0, 0, frame.shape[1], frame.shape[0])]
+    if use_tiling:
+        h, w = frame.shape[:2]
+        overlap_x = w // 12
+        overlap_y = h // 12
+        mid_x = w // 2
+        mid_y = h // 2
+        regions.extend([
+            (0, 0, min(w, mid_x + overlap_x), min(h, mid_y + overlap_y)),
+            (max(0, mid_x - overlap_x), 0, w, min(h, mid_y + overlap_y)),
+            (0, max(0, mid_y - overlap_y), min(w, mid_x + overlap_x), h),
+            (max(0, mid_x - overlap_x), max(0, mid_y - overlap_y), w, h),
+        ])
+
+    all_boxes = []
+    all_scores = []
+    for x1, y1, x2, y2 in regions:
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
+        blob, scale, pad_x, pad_y = preprocess(crop, config.model_input_size)
+        output = session.run(None, {input_name: blob})[0]
+        boxes, scores = postprocess(
+            output, scale, pad_x, pad_y, crop.shape[1], crop.shape[0],
+            conf_threshold=config.conf_threshold,
+            iou_threshold=config.iou_threshold,
+            max_candidates=config.max_candidates,
+            max_faces=config.max_faces,
+            return_scores=True,
+        )
+        if len(boxes) == 0:
+            continue
+        boxes[:, [0, 2]] += x1
+        boxes[:, [1, 3]] += y1
+        all_boxes.append(boxes)
+        all_scores.append(scores)
+
+    if not all_boxes:
+        if return_scores:
+            return np.empty((0, 4), dtype=np.float32), np.empty((0,), dtype=np.float32)
+        return []
+
+    boxes = np.vstack(all_boxes)
+    scores = np.concatenate(all_scores)
+    keep = nms(boxes.astype(np.float32), scores, config.iou_threshold)
+    boxes = boxes[keep]
+    scores = scores[keep]
+    if len(boxes) > config.max_faces:
+        top_faces = scores.argsort()[::-1][:config.max_faces]
+        boxes = boxes[top_faces]
+        scores = scores[top_faces]
+    if return_scores:
+        return boxes.astype(np.float32), scores.astype(np.float32)
     return boxes.astype(int)
+
+class YoloFaceDetector:
+    name = "YOLOv8n-face"
+
+    def __init__(self, model_path):
+        self.session = create_onnx_session(model_path)
+        self.input_name = self.session.get_inputs()[0].name
+        self.use_tiling = config.tile_detection and "Dml" in config.provider_name
+        if self.use_tiling:
+            print("✅ YOLOタイル検出ON: 遠くの小さい顔も検出しやすくします")
+
+    def detect(self, frame):
+        return detect_faces(self.session, self.input_name, frame, self.use_tiling, return_scores=True)
+
+class YuNetFaceDetector:
+    name = "YuNet"
+
+    def __init__(self, model_path):
+        if not hasattr(cv2, "FaceDetectorYN"):
+            raise RuntimeError("このOpenCVにはFaceDetectorYNがありません")
+        model_path = ascii_model_path(model_path)
+        self.detector = cv2.FaceDetectorYN.create(
+            model_path,
+            "",
+            (config.width, config.height),
+            score_threshold=float(config.conf_threshold),
+            nms_threshold=float(config.iou_threshold),
+            top_k=max(5000, config.max_candidates),
+        )
+        self.input_size = None
+        config.provider_name = "OpenCV YuNet"
+
+    def detect(self, frame):
+        h, w = frame.shape[:2]
+        scale = min(1.0, float(config.yunet_max_side) / max(w, h))
+        if scale < 1.0:
+            det_w, det_h = int(w * scale), int(h * scale)
+            det_frame = cv2.resize(frame, (det_w, det_h), interpolation=cv2.INTER_AREA)
+        else:
+            det_w, det_h = w, h
+            det_frame = frame
+
+        if self.input_size != (det_w, det_h):
+            self.detector.setInputSize((det_w, det_h))
+            self.input_size = (det_w, det_h)
+        _, faces = self.detector.detect(det_frame)
+        if faces is None or len(faces) == 0:
+            return np.empty((0, 4), dtype=np.float32), np.empty((0,), dtype=np.float32)
+        faces = faces[:config.max_faces]
+        boxes = np.empty((len(faces), 4), dtype=np.float32)
+        boxes[:, 0] = faces[:, 0] / scale
+        boxes[:, 1] = faces[:, 1] / scale
+        boxes[:, 2] = (faces[:, 0] + faces[:, 2]) / scale
+        boxes[:, 3] = (faces[:, 1] + faces[:, 3]) / scale
+        boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, w)
+        boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, h)
+        scores = faces[:, -1].astype(np.float32)
+        return boxes, scores
+
+def distance2bbox(points, distance):
+    x1 = points[:, 0] - distance[:, 0]
+    y1 = points[:, 1] - distance[:, 1]
+    x2 = points[:, 0] + distance[:, 2]
+    y2 = points[:, 1] + distance[:, 3]
+    return np.stack([x1, y1, x2, y2], axis=-1)
+
+class SCRFDFaceDetector:
+    name = "SCRFD_2.5G_KPS"
+
+    def __init__(self, model_path):
+        self.session = create_onnx_session(model_path)
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_names = [o.name for o in self.session.get_outputs()]
+        self.fmc = 3
+        self.strides = [8, 16, 32]
+        self.num_anchors = 2
+        self.input_size = (config.model_input_size, config.model_input_size)
+        self.input_mean = 127.5
+        self.input_std = 128.0
+        self.center_cache = {}
+
+    def _anchor_centers(self, height, width, stride):
+        key = (height, width, stride)
+        if key not in self.center_cache:
+            centers = np.stack(np.mgrid[:height, :width][::-1], axis=-1).astype(np.float32)
+            centers = (centers * stride).reshape((-1, 2))
+            centers = np.stack([centers] * self.num_anchors, axis=1).reshape((-1, 2))
+            if len(self.center_cache) < 100:
+                self.center_cache[key] = centers
+        return self.center_cache[key]
+
+    def detect(self, frame):
+        input_w, input_h = self.input_size
+        im_h, im_w = frame.shape[:2]
+        im_ratio = float(im_h) / im_w
+        model_ratio = float(input_h) / input_w
+        if im_ratio > model_ratio:
+            new_h = input_h
+            new_w = int(new_h / im_ratio)
+        else:
+            new_w = input_w
+            new_h = int(new_w * im_ratio)
+        det_scale = float(new_h) / im_h
+        resized = cv2.resize(frame, (new_w, new_h))
+        det_img = np.zeros((input_h, input_w, 3), dtype=np.uint8)
+        det_img[:new_h, :new_w, :] = resized
+
+        blob = cv2.dnn.blobFromImage(
+            det_img,
+            1.0 / self.input_std,
+            (input_w, input_h),
+            (self.input_mean, self.input_mean, self.input_mean),
+            swapRB=True,
+        )
+        net_outs = self.session.run(self.output_names, {self.input_name: blob})
+        scores_all = []
+        boxes_all = []
+
+        for idx, stride in enumerate(self.strides):
+            scores = net_outs[idx]
+            bbox_preds = net_outs[idx + self.fmc] * stride
+            if scores.ndim == 3:
+                scores = scores[0]
+                bbox_preds = bbox_preds[0]
+            feat_h = input_h // stride
+            feat_w = input_w // stride
+            anchor_centers = self._anchor_centers(feat_h, feat_w, stride)
+            pos_inds = np.where(scores.ravel() >= config.conf_threshold)[0]
+            if len(pos_inds) == 0:
+                continue
+            boxes = distance2bbox(anchor_centers, bbox_preds)
+            scores_all.append(scores.ravel()[pos_inds])
+            boxes_all.append(boxes[pos_inds])
+
+        if not boxes_all:
+            return np.empty((0, 4), dtype=np.float32), np.empty((0,), dtype=np.float32)
+
+        boxes = np.vstack(boxes_all) / det_scale
+        scores = np.concatenate(scores_all).astype(np.float32)
+        order = scores.argsort()[::-1]
+        if len(order) > config.max_candidates:
+            order = order[:config.max_candidates]
+        boxes = boxes[order]
+        scores = scores[order]
+
+        keep = nms(boxes.astype(np.float32), scores, config.iou_threshold)
+        boxes = boxes[keep]
+        scores = scores[keep]
+        if len(boxes) > config.max_faces:
+            top_faces = scores.argsort()[::-1][:config.max_faces]
+            boxes = boxes[top_faces]
+            scores = scores[top_faces]
+
+        boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, im_w)
+        boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, im_h)
+        return boxes.astype(np.float32), scores.astype(np.float32)
+
+def create_face_detector():
+    requested = config.detector_backend
+    candidates = {
+        "scrfd": [(SCRFDFaceDetector, SCRFD_MODEL_PATH), (YuNetFaceDetector, YUNET_MODEL_PATH), (YoloFaceDetector, YOLO_MODEL_PATH)],
+        "yunet": [(YuNetFaceDetector, YUNET_MODEL_PATH), (SCRFDFaceDetector, SCRFD_MODEL_PATH), (YoloFaceDetector, YOLO_MODEL_PATH)],
+        "yolo": [(YoloFaceDetector, YOLO_MODEL_PATH), (SCRFDFaceDetector, SCRFD_MODEL_PATH), (YuNetFaceDetector, YUNET_MODEL_PATH)],
+    }.get(requested, [])
+    if not candidates:
+        candidates = [(SCRFDFaceDetector, SCRFD_MODEL_PATH), (YuNetFaceDetector, YUNET_MODEL_PATH), (YoloFaceDetector, YOLO_MODEL_PATH)]
+
+    errors = []
+    for detector_cls, model_path in candidates:
+        if not os.path.exists(model_path):
+            errors.append(f"{detector_cls.name}: model not found: {model_path}")
+            continue
+        try:
+            detector = detector_cls(model_path)
+            config.detector_backend = detector.name
+            print(f"✅ Face detector: {detector.name}")
+            return detector
+        except Exception as e:
+            errors.append(f"{detector_cls.name}: {e}")
+
+    raise RuntimeError("顔検出モデルを初期化できません: " + " / ".join(errors))
+
+def update_face_tracks(current_faces, face_history, now):
+    """最大20人程度を想定した軽量トラッキング。全候補ペアを評価してID入れ替わりを抑える"""
+    candidates = []
+    for face_idx, (cx, cy, fs) in enumerate(current_faces):
+        for fid, data in face_history.items():
+            prev_cx, prev_cy, prev_fs = data["history"][-1]
+            dist = float(np.hypot(cx - prev_cx, cy - prev_cy))
+            size_diff = abs(fs - prev_fs) / max(fs, prev_fs, 1)
+            gate = max(config.distance_threshold, min(220, max(fs, prev_fs) * 0.85))
+            if dist <= gate and size_diff <= 0.65:
+                score = (dist / gate) + size_diff * 0.35
+                candidates.append((score, face_idx, fid))
+
+    candidates.sort(key=lambda item: item[0])
+    matched_faces = set()
+    matched_tracks = set()
+    new_face_history = {}
+
+    for _, face_idx, fid in candidates:
+        if face_idx in matched_faces or fid in matched_tracks:
+            continue
+        cx, cy, fs = current_faces[face_idx]
+        history = face_history[fid]["history"]
+        history.append((cx, cy, fs))
+        if len(history) > 20:
+            history.pop(0)
+        new_face_history[fid] = {"history": history, "last_update": now}
+        matched_faces.add(face_idx)
+        matched_tracks.add(fid)
+
+    for face_idx, (cx, cy, fs) in enumerate(current_faces):
+        if face_idx in matched_faces:
+            continue
+        fid = config.next_face_id
+        config.next_face_id += 1
+        new_face_history[fid] = {"history": [(cx, cy, fs)], "last_update": now}
+
+    for fid, data in face_history.items():
+        if fid in matched_tracks:
+            continue
+        if now - data["last_update"] > config.track_hold_seconds:
+            continue
+        ghost_cx, ghost_cy, ghost_fs = data["history"][-1]
+        near_current = any(
+            np.hypot(cx - ghost_cx, cy - ghost_cy) < max(config.distance_threshold, ghost_fs * 0.9)
+            for (cx, cy, fs) in current_faces
+        )
+        if not near_current:
+            new_face_history[fid] = data
+
+    return new_face_history
+
+def create_external_tracker():
+    if not (config.use_external_tracker and HAS_BYTETRACK):
+        return None
+    try:
+        return ByteTrackTracker(
+            lost_track_buffer=20,
+            frame_rate=float(config.fps),
+            track_activation_threshold=max(0.25, config.conf_threshold),
+            minimum_consecutive_frames=1,
+            minimum_iou_threshold=0.1,
+            high_conf_det_threshold=max(0.45, config.conf_threshold + 0.1),
+        )
+    except Exception as e:
+        print(f"⚠ ByteTrack初期化失敗。内蔵trackerへフォールバックします: {e}")
+        return None
+
+def update_face_tracks_with_bytetrack(boxes, scores, tracker, face_history, now):
+    if tracker is None:
+        current_faces = []
+        for box in boxes:
+            x1, y1, x2, y2 = box.astype(int)
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            face_size = int(max(x2 - x1, y2 - y1) * config.scale)
+            current_faces.append((cx, cy, face_size))
+        return update_face_tracks(current_faces, face_history, now)
+
+    if len(boxes) == 0:
+        detections = sv.Detections.empty()
+    else:
+        detections = sv.Detections(
+            xyxy=boxes.astype(np.float32),
+            confidence=scores.astype(np.float32),
+            class_id=np.zeros(len(boxes), dtype=int),
+        )
+
+    tracked = tracker.update(detections)
+    track_ids = tracked.tracker_id
+    if track_ids is None or len(track_ids) == 0:
+        return {
+            fid: data for fid, data in face_history.items()
+            if now - data["last_update"] <= config.track_hold_seconds
+        }
+
+    new_face_history = {}
+    for box, fid in zip(tracked.xyxy, track_ids):
+        fid = int(fid)
+        if fid < 0:
+            continue
+        x1, y1, x2, y2 = box.astype(int)
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        face_size = int(max(x2 - x1, y2 - y1) * config.scale)
+        history = face_history.get(fid, {"history": []})["history"]
+        history.append((cx, cy, face_size))
+        if len(history) > 20:
+            history.pop(0)
+        new_face_history[fid] = {"history": history, "last_update": now}
+
+    for fid, data in face_history.items():
+        if fid not in new_face_history and now - data["last_update"] <= config.track_hold_seconds:
+            new_face_history[fid] = data
+
+    return new_face_history
 
 # --- アルファ合成 ---
 def overlay_transparent(background, overlay, x, y):
@@ -334,10 +758,15 @@ def camera_thread():
 
     overlay_img = load_mask(config.current_mask_name)
     loaded_mask_name = config.current_mask_name
+    resized_mask_cache = {}
 
-    # ONNX Runtimeセッション作成
-    session = create_onnx_session(MODEL_PATH)
-    input_name = session.get_inputs()[0].name
+    # 顔検出器作成
+    detector = create_face_detector()
+    external_tracker = create_external_tracker()
+    if external_tracker is not None:
+        print("✅ ByteTrack tracker ON: 複数人のID維持を強化します")
+    else:
+        print("ℹ️ 内蔵trackerを使用します")
 
     face_history = {}
     last_infer_time = 0
@@ -386,6 +815,7 @@ def camera_thread():
                 if new_img is not None:
                     overlay_img = new_img
                     loaded_mask_name = config.current_mask_name
+                    resized_mask_cache.clear()
 
             ret, frame = cap.read()
             if not ret:
@@ -399,57 +829,8 @@ def camera_thread():
 
             now = time.time()
             if now - last_infer_time > config.infer_interval:
-                # ONNX推論
-                blob, scale, _, _ = preprocess(frame, 640)
-                output = session.run(None, {input_name: blob})[0]
-                boxes = postprocess(output, scale, frame.shape[1], frame.shape[0])
-                
-                current_faces = []
-                for box in boxes:
-                    x1, y1, x2, y2 = box
-                    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                    face_size = int(max(x2 - x1, y2 - y1) * config.scale)
-                    current_faces.append((cx, cy, face_size))
-                
-                new_face_history = {}
-                matched_old_ids = set()  # マッチ済みIDを追跡して二重マッチを防止
-                for (cx, cy, fs) in current_faces:
-                    matched_id = None
-                    min_dist = config.distance_threshold
-                    for fid, data in face_history.items():
-                        if fid in matched_old_ids:  # 既にマッチ済みならスキップ
-                            continue
-                        prev_cx, prev_cy, _ = data["history"][-1]
-                        dist = np.sqrt((cx - prev_cx)**2 + (cy - prev_cy)**2)
-                        if dist < min_dist:
-                            min_dist = dist
-                            matched_id = fid
-                    
-                    if matched_id is not None:
-                        matched_old_ids.add(matched_id)  # マッチ済みとして記録
-                        history = face_history[matched_id]["history"]
-                        history.append((cx, cy, fs))
-                        if len(history) > 20: 
-                            history.pop(0)
-                        new_face_history[matched_id] = {"history": history, "last_update": now}
-                    else:
-                        new_id = time.time() + np.random.rand()
-                        new_face_history[new_id] = {"history": [(cx, cy, fs)], "last_update": now}
-                
-                # ゴースト保持: 現在の検出に近いものは移動した顔なので保持しない
-                for fid, data in face_history.items():
-                    if fid in matched_old_ids or fid in new_face_history:
-                        continue
-                    if now - data["last_update"] < 0.5:
-                        ghost_cx, ghost_cy, _ = data["history"][-1]
-                        near_current = any(
-                            np.sqrt((cx - ghost_cx)**2 + (cy - ghost_cy)**2) < config.distance_threshold * 3
-                            for (cx, cy, fs) in current_faces
-                        )
-                        if not near_current:
-                            new_face_history[fid] = data
-
-                face_history = new_face_history
+                boxes, scores = detector.detect(frame)
+                face_history = update_face_tracks_with_bytetrack(boxes, scores, external_tracker, face_history, now)
                 last_infer_time = now
 
             if config.mask_enabled and overlay_img is not None:
@@ -495,9 +876,14 @@ def camera_thread():
                         avg_fs = latest_fs
 
                     try:
-                        resized = cv2.resize(overlay_img, (avg_fs, avg_fs))
-                        x_offset = avg_cx - avg_fs // 2
-                        y_offset = avg_cy - avg_fs // 2
+                        mask_size = max(1, int(round(avg_fs / 4) * 4))
+                        if mask_size not in resized_mask_cache:
+                            if len(resized_mask_cache) > 64:
+                                resized_mask_cache.clear()
+                            resized_mask_cache[mask_size] = cv2.resize(overlay_img, (mask_size, mask_size))
+                        resized = resized_mask_cache[mask_size]
+                        x_offset = avg_cx - mask_size // 2
+                        y_offset = avg_cy - mask_size // 2
                         frame = overlay_transparent(frame, resized, x_offset, y_offset)
                     except cv2.error:
                         continue
@@ -724,6 +1110,8 @@ class ControlApp(ctk.CTk):
             # provider確定 → 表示更新
             if "Dml" in config.provider_name:
                 self.label_provider.configure(text="✅ GPU推論 (DirectML)", text_color="#2d8659")
+            elif "YuNet" in config.provider_name:
+                self.label_provider.configure(text="✅ 高速検出 (YuNet/OpenCV)", text_color="#2d8659")
             else:
                 self.label_provider.configure(text="⚠ CPU推論（低速）", text_color="#9e6b2b")
             return

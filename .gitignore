@@ -8,6 +8,7 @@ ENV/
 env/
 build/
 dist/
+.mplconfig/
 
 # MediaPipe
 mediapipe-env/
@@ -26,3 +27,4 @@ Thumbs.db
 
 InnoSetup_Output/
 build_log*.txt
+outputs/

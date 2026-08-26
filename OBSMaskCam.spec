@@ -14,11 +14,16 @@ a = Analysis(
     binaries=ort_binaries,
     datas=[
         ('yolov8n-face.onnx', '.'),          # ONNXモデル
+        ('models/face_detection_yunet_2026may.onnx', 'models'),
+        ('models/scrfd_2.5g_kps.onnx', 'models'),
     ] + ctk_datas,
     hiddenimports=[
         'onnxruntime',
         'customtkinter',
         'pyvirtualcam',
+        'supervision',
+        'trackers',
+        'trackers.core.bytetrack.tracker',
         'pygrabber',
         'pygrabber.dshow_graph',
         'comtypes',
@@ -32,7 +37,7 @@ a = Analysis(
         'torch', 'torchvision', 'torchaudio',
         'ultralytics',
         'mediapipe',
-        'matplotlib', 'scipy', 'polars',
+        'polars',
         'numpy.f2py', 'pandas',
     ],
     noarchive=False,

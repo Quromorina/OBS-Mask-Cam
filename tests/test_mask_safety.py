@@ -4,19 +4,25 @@
 """
 import os
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import mask_safety  # noqa: E402
 from mask_safety import (  # noqa: E402
+    MIN_COVER_SIZE,
     cover_face,
+    decide_mask_status,
     fit_frame,
     normalize_mask_image,
     obscure_frame,
     obscure_region,
+    save_mask_png,
 )
 
 
@@ -117,6 +123,53 @@ class ObscureTest(unittest.TestCase):
         obscure_region(original.copy(), 5000, 5000, 200)  # 完全に画面外でも例外にならない
         obscure_region(original.copy(), 640, 360, 0)
 
+    def test_tiny_sizes_still_obscure_pixels(self):
+        # size が 0〜1（や負の値）でも、何もせず返さない。下限の広さまで潰す。
+        half = MIN_COVER_SIZE // 2
+        for size in (-5, 0, 1, 2, 3, 7, MIN_COVER_SIZE):
+            original = noisy_frame()
+            frame = obscure_region(original.copy(), 640, 360, size)
+            region = (slice(360 - half, 360 + half), slice(640 - half, 640 + half))
+            self.assertFalse(np.array_equal(frame[region], original[region]), msg=f"size={size}")
+            # 元の画素がそのまま残っていない（全画素が元と違う色になっている）
+            unchanged = (frame[region] == original[region]).all(axis=2)
+            self.assertLess(unchanged.mean(), 0.05, msg=f"size={size}")
+            # 領域の外は触らない
+            self.assertTrue(np.array_equal(frame[:360 - half], original[:360 - half]))
+            self.assertTrue(np.array_equal(frame[:, :640 - half], original[:, :640 - half]))
+            self.assertTrue(np.array_equal(frame[360 + half:], original[360 + half:]))
+            self.assertTrue(np.array_equal(frame[:, 640 + half:], original[:, 640 + half:]))
+
+    def test_small_region_uses_coarse_blocks(self):
+        # 小さい領域を 8 ブロックに潰すと元の画素のままになるので、ブロックを粗くする
+        original = noisy_frame()
+        frame = obscure_region(original.copy(), 640, 360, 8)  # 下限の 16px に広がる
+        region = frame[352:368, 632:648]
+        colors = np.unique(region.reshape(-1, 3), axis=0)
+        self.assertLessEqual(len(colors), 16)  # 16px なら 4x4 ブロック以下
+
+    def test_thin_region_at_frame_edge_is_obscured(self):
+        # 画面端で 1px 幅に切れた領域も、元の画素のままにしない（平均色で塗る）
+        original = noisy_frame()
+        frame = obscure_region(original.copy(), -7, 360, 16)  # x は 0 の 1 列だけ残る
+        self.assertFalse(np.array_equal(frame[352:368, 0:1], original[352:368, 0:1]))
+        self.assertEqual(len(np.unique(frame[352:368, 0].reshape(-1, 3), axis=0)), 4)
+
+    def test_odd_size_covers_full_width(self):
+        original = noisy_frame()
+        frame = obscure_region(original.copy(), 640, 360, 201)
+        # 一辺 201 なら x は 540〜740（741 の手前）まで。右端の列も潰れている
+        self.assertFalse(np.array_equal(frame[260:461, 740], original[260:461, 740]))
+        self.assertTrue(np.array_equal(frame[:, 741:], original[:, 741:]))
+
+    def test_mosaic_failure_falls_back_to_fill(self):
+        original = noisy_frame()
+        with mock.patch.object(mask_safety.cv2, "resize", side_effect=cv2.error("boom")):
+            frame = obscure_region(original.copy(), 640, 360, 1)
+        half = MIN_COVER_SIZE // 2
+        self.assertTrue((frame[360 - half:360 + half, 640 - half:640 + half]
+                         == mask_safety.FILL_COLOR).all())
+
     def test_obscure_frame_changes_everything(self):
         original = noisy_frame()
         out = obscure_frame(original.copy())
@@ -161,11 +214,103 @@ class CoverFaceTest(unittest.TestCase):
         _, used_mask = self.assert_face_hidden(overlay)
         self.assertTrue(used_mask)
 
+    def test_tiny_face_size_is_still_covered(self):
+        # 顔サイズが 0〜1 でも、マスクあり・なしのどちらの経路でも下限の広さを隠す
+        half = MIN_COVER_SIZE // 2
+        region = (slice(360 - half, 360 + half), slice(640 - half, 640 + half))
+        red = np.zeros((50, 50, 4), np.uint8)
+        red[:, :] = (0, 0, 255, 255)
+        for size in (-3, 0, 1):
+            original = noisy_frame()
+            frame, used_mask = cover_face(original.copy(), red, 640, 360, size)
+            self.assertTrue(used_mask, msg=f"size={size}")
+            self.assertTrue((frame[region] == (0, 0, 255)).all(), msg=f"size={size}")
+
+            frame, used_mask = cover_face(original.copy(), None, 640, 360, size)
+            self.assertFalse(used_mask, msg=f"size={size}")
+            unchanged = (frame[region] == original[region]).all(axis=2)
+            self.assertLess(unchanged.mean(), 0.05, msg=f"size={size}")
+
+    def test_overlay_failure_falls_back_to_mosaic(self):
+        original = noisy_frame()
+        overlay = np.full((50, 50, 4), 255, np.uint8)
+        with mock.patch.object(mask_safety, "overlay_transparent", side_effect=cv2.error("boom")):
+            frame, used_mask = cover_face(original.copy(), overlay, 640, 360, 200)
+        self.assertFalse(used_mask)
+        self.assertFalse(np.array_equal(frame[260:460, 540:740], original[260:460, 540:740]))
+
     def test_mask_partly_outside_frame(self):
         overlay = np.full((50, 50, 4), 255, np.uint8)
         frame, used_mask = cover_face(noisy_frame(), overlay, 10, 10, 200)
         self.assertTrue(used_mask)
         self.assertTrue((frame[:110, :110] == 255).all())
+
+
+class DecideMaskStatusTest(unittest.TestCase):
+    def test_off_and_detector_error_take_priority(self):
+        self.assertEqual(decide_mask_status(False, True, True, 1), "off")
+        self.assertEqual(decide_mask_status(False, False, False, 0), "off")
+        self.assertEqual(decide_mask_status(True, False, True, 1), "detector_error")
+        self.assertEqual(decide_mask_status(True, False, True, 0), "detector_error")
+
+    def test_no_face_is_not_reported_as_applied(self):
+        self.assertEqual(decide_mask_status(True, True, True, 0), "no_face")
+        self.assertEqual(decide_mask_status(True, True, False, 0), "no_face_fallback")
+
+    def test_faces_covered(self):
+        self.assertEqual(decide_mask_status(True, True, True, 1), "ok")
+        self.assertEqual(decide_mask_status(True, True, True, 3, all_masks_applied=True), "ok")
+        self.assertEqual(decide_mask_status(True, True, True, 2, all_masks_applied=False), "fallback")
+        self.assertEqual(decide_mask_status(True, True, False, 1), "fallback")
+        self.assertEqual(decide_mask_status(True, True, False, 1, all_masks_applied=False), "fallback")
+
+
+class SaveMaskPngTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+        self.img = np.zeros((20, 30, 4), np.uint8)
+        self.img[:, :] = (10, 20, 30, 200)
+
+    def read(self, path):
+        return cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+
+    def test_saves_and_can_be_read_back(self):
+        path = os.path.join(self.dir, "マスク.png")  # 日本語のファイル名
+        self.assertTrue(save_mask_png(path, self.img))
+        self.assertTrue(np.array_equal(self.read(path), self.img))
+        self.assertEqual(os.listdir(self.dir), ["マスク.png"])  # 一時ファイルを残さない
+
+    def test_missing_folder_returns_false(self):
+        path = os.path.join(self.dir, "no_such_dir", "a.png")
+        self.assertFalse(save_mask_png(path, self.img))
+        self.assertFalse(os.path.exists(path))
+
+    def test_encode_failure_returns_false(self):
+        path = os.path.join(self.dir, "a.png")
+        with mock.patch.object(mask_safety.cv2, "imencode", return_value=(False, None)):
+            self.assertFalse(save_mask_png(path, self.img))
+        with mock.patch.object(mask_safety.cv2, "imencode", side_effect=cv2.error("boom")):
+            self.assertFalse(save_mask_png(path, self.img))
+        self.assertFalse(save_mask_png(path, None))
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_failed_save_keeps_existing_mask(self):
+        path = os.path.join(self.dir, "a.png")
+        self.assertTrue(save_mask_png(path, self.img))
+        other = np.full((5, 5, 4), 255, np.uint8)
+        # 書き込んだ内容が壊れていた（読み戻せない）場合
+        with mock.patch.object(mask_safety.cv2, "imdecode", return_value=None):
+            self.assertFalse(save_mask_png(path, other))
+        self.assertTrue(np.array_equal(self.read(path), self.img))
+        self.assertEqual(os.listdir(self.dir), ["a.png"])
+
+    def test_replace_failure_returns_false(self):
+        path = os.path.join(self.dir, "a.png")
+        with mock.patch.object(mask_safety.os, "replace", side_effect=PermissionError("locked")):
+            self.assertFalse(save_mask_png(path, self.img))
+        self.assertEqual(os.listdir(self.dir), [])
 
 
 if __name__ == "__main__":

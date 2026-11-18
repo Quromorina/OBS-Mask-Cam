@@ -9,7 +9,7 @@
 ## ⚠️ 前提条件 (必ずご確認ください)
 
 - **OBS Studio**: 本アプリは仮想カメラを使用するため、事前に [OBS Studio](https://obsproject.com/ja/download) がインストールされていることが**前提**となります。
-- **GPU搭載PC**: AIによるリアルタイム顔認識を行うため、グラフィックボード（GPU）を搭載したPCでのご利用を**推奨**します（CPUのみの環境でも動作しますが、映像がカクつく場合があります）。
+- **GPUは不要**: 顔検出には軽量なモデル（YuNet）を使い、CPUで動作します。グラフィックボード（GPU）の有無は問いません。
 
 ## 🚀 クイックスタート (使い方)
 
@@ -60,7 +60,7 @@
 
 ご自身でソースコードから実行・改変したい場合の手順です。
 
-**前提条件**: Python 3.10+, NVIDIA/AMD/Intel GPU (DirectML対応環境での実行を推奨)
+**前提条件**: Python 3.10+、OpenCV 4.x 系（`requirements.txt` の `opencv-python` 4.13 を想定。顔検出に `cv2.FaceDetectorYN` を使います）
 
 ```bash
 # 1. リポジトリのクローン
@@ -73,11 +73,11 @@ pip install -r requirements.txt
 # 3. アプリの起動
 python main.py
 ```
-> **Tip**: 顔検出用AIモデル（`yolov8n-face.onnx`）はリポジトリに同梱しています。ダウンロードは行いません（アプリはネットワーク通信をしません）。
+> **Tip**: 顔検出用AIモデル（`face_detection_yunet_2023mar.onnx`）はリポジトリに同梱しています。ダウンロードは行いません（アプリはネットワーク通信をしません）。
 
-Windows 専用です（DirectML・OBS Virtual Camera・DirectShow を使うため）。
+Windows 専用です（OBS Virtual Camera・DirectShow を使うため）。
 
-画像処理の単体テスト（GUI・カメラ不要）は次で実行できます。
+画像処理と顔検出の単体テスト（GUI・カメラ不要）は次で実行できます。
 
 ```bash
 python -m unittest discover -s tests -v
@@ -91,7 +91,7 @@ python -m unittest discover -s tests -v
 A. Windowsの「設定」>「プライバシーとセキュリティ」>「カメラ」にて、**「アプリにカメラへのアクセスを許可する」がオン**になっているか確認してください。また、Zoomなど他の通話アプリが既にカメラを使用中の場合は、一度終了させてください。
 
 **Q. マスクの追従が遅い、映像がカクカクする**  
-A. アプリ上部のステータスが「⚠ CPU推論（低速）」となっている場合、GPUが正しく認識されていません。グラフィックボードのドライバーを最新版に更新してください。（DirectMLを採用しているため、NVIDIAだけでなくAMD RadeonやIntelのGPUでも高速な推論動作が可能です）
+A. 顔検出はCPUで行っています。他の重いアプリ（ゲーム、動画のエンコードなど）がCPUを使い切っていないか確認してください。カメラ側の設定で解像度やフレームレートが極端に高くなっている場合も、下げると改善することがあります。
 
 **Q. 「顔検出モデルを読み込めませんでした」「映像処理がエラーで停止しました」と表示される**  
 A. 理由は画面のエラー表示と、ログファイル `%APPDATA%\OBSMaskCam\app.log` に記録されます。不具合報告の際はこのログを添えてください（ログにはユーザー名を含むフォルダのパスが入ります。公開の場に貼るときは伏せてください）。
@@ -119,10 +119,17 @@ Get-FileHash .\OBSMaskCam_Setup_v1.0.0.exe -Algorithm SHA256
 
 | 項目 | 内容 |
 |---|---|
-| ファイル | `yolov8n-face.onnx`（約 12.7 MB） |
-| SHA-256 | `9c5aa75ac4e45393afeb299278ff4dd713755a2ae4b75aafb5aeaab3c9f41960` |
-| 元の重み | [akanametov/yolo-face](https://github.com/akanametov/yolo-face) の `yolov8n-face.pt`（同リポジトリは ONNX 版の yolov8n-face を配布していないため、`.pt` から ONNX へ書き出したもの） |
-| ライセンス | 配布元リポジトリは GPL-3.0 を掲げています（YOLOv8 本体の Ultralytics は現在 AGPL-3.0）。**このモデルファイルは本リポジトリの MIT ライセンスの対象外**です。 |
+| モデル | YuNet（顔検出。顔の枠・5点のランドマーク・信頼度を出力） |
+| ファイル | `face_detection_yunet_2023mar.onnx`（232,589 バイト） |
+| SHA-256 | `8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4` |
+| 配布元 | [OpenCV Zoo `models/face_detection_yunet`](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet)（学習元は [ShiqiYu/libfacedetection.train](https://github.com/ShiqiYu/libfacedetection.train)） |
+| ライセンス | MIT License（Copyright (c) 2020 Shiqi Yu）。ライセンス文は [`licenses/YuNet-LICENSE.txt`](licenses/YuNet-LICENSE.txt) に同梱しています。 |
+
+SHA-256 は OpenCV Zoo が同ファイルについて記録している値（Git LFS の oid）と同じです。手元のファイルは次で確認できます。
+
+```powershell
+Get-FileHash .\face_detection_yunet_2023mar.onnx -Algorithm SHA256
+```
 
 ---
 
@@ -130,8 +137,8 @@ Get-FileHash .\OBSMaskCam_Setup_v1.0.0.exe -Algorithm SHA256
 
 高速で軽量な動作を実現するため、以下の技術スタックを中心に構成しています。
 
-- **AI顔検出モデル**: [YOLOv8n-face (ONNX)](https://github.com/akanametov/yolo-face)
-- **AI推論エンジン**: ONNX Runtime + DirectML
+- **AI顔検出モデル**: [YuNet (OpenCV Zoo)](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet)
+- **AI推論エンジン**: OpenCV DNN（`cv2.FaceDetectorYN`、CPU推論）
 - **GUIフレームワーク**: CustomTkinter
 - **仮想カメラ連携**: pyvirtualcam
 - **ビルド・パッケージング**: PyInstaller / Inno Setup
@@ -140,4 +147,4 @@ Get-FileHash .\OBSMaskCam_Setup_v1.0.0.exe -Algorithm SHA256
 
 ソースコードは [MIT License](LICENSE) © [Quromorina](https://github.com/Quromorina) です。
 
-同梱している顔検出モデル（`yolov8n-face.onnx`）は別のライセンスです。上の「同梱モデルについて」を参照してください。
+同梱している顔検出モデル（YuNet）も MIT License です（著作権者は別です。上の「同梱モデルについて」を参照してください）。

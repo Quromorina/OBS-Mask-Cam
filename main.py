@@ -4,16 +4,6 @@ import pyvirtualcam
 from pyvirtualcam import PixelFormat
 import os
 import sys
-
-# EXE環境ではonnxruntimeのDLLパスを事前にPATHに追加
-if getattr(sys, 'frozen', False):
-    _ort_capi = os.path.join(sys._MEIPASS, 'onnxruntime', 'capi')
-    if os.path.isdir(_ort_capi):
-        os.environ['PATH'] = _ort_capi + os.pathsep + os.environ.get('PATH', '')
-        if hasattr(os, 'add_dll_directory'):
-            os.add_dll_directory(_ort_capi)
-
-import onnxruntime as ort
 import time
 import threading
 import logging
@@ -23,6 +13,7 @@ import shutil
 from tkinter import filedialog, messagebox
 from PIL import Image
 from mask_safety import normalize_mask_image, fit_frame, obscure_frame, cover_face
+from face_detector import FaceDetector, MODEL_FILENAME
 try:
     from pygrabber.dshow_graph import FilterGraph
     HAS_PYGRABBER = True
@@ -57,7 +48,7 @@ else:
     # 通常のPython実行
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
     BUNDLE_DIR = APP_DIR
-MODEL_PATH = os.path.join(BUNDLE_DIR, "yolov8n-face.onnx")
+MODEL_PATH = os.path.join(BUNDLE_DIR, MODEL_FILENAME)
 
 # 共有データ（ユーザーごとのAppData\Roamingに保存）
 USER_DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "OBSMaskCam")
@@ -107,7 +98,7 @@ class AppConfig:
     camera_index = 0
     camera_list = []
     camera_mapping = {}          # カメラ名 -> システムIndexの対応
-    provider_name = ""           # GPU/CPU表示用
+    provider_name = ""           # 顔検出の方式の表示用（空のあいだは「起動中」）
     startup_error = ""           # エラー種別: camera / virtualcam / model / internal
     error_detail = ""            # 画面に出すエラーの理由
     face_hold_seconds = 1.5      # 顔を見失ってからマスクをその場に残す秒数
@@ -200,112 +191,6 @@ else:
     config.current_mask_name = ""
     print("⚠ マスク画像が見つかりません")
 
-# --- ONNX推論ヘルパー ---
-def create_onnx_session(model_path):
-    """作成ONNX Runtimeセッション（DirectML → CPU fallback）"""
-    providers = []
-    available = ort.get_available_providers()
-    print(f"🔍 利用可能なProvider: {available}")
-    if 'DmlExecutionProvider' in available:
-        providers.append('DmlExecutionProvider')
-    providers.append('CPUExecutionProvider')
-    
-    try:
-        session = ort.InferenceSession(model_path, providers=providers)
-    except Exception:
-        if providers == ['CPUExecutionProvider']:
-            raise
-        # DirectMLで作れない環境（ドライバ不整合など）はCPUでやり直す
-        log.exception("DirectML でのセッション作成に失敗しました。CPU で再試行します")
-        session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
-    active_provider = session.get_providers()[0]
-    config.provider_name = active_provider
-    print(f"✅ Using provider: {active_provider}")
-    return session
-
-def preprocess(frame, input_size=640):
-    """フレームをONNX入力形式にリサイズ＆正規化"""
-    h, w = frame.shape[:2]
-    scale = min(input_size / w, input_size / h)
-    new_w, new_h = int(w * scale), int(h * scale)
-    resized = cv2.resize(frame, (new_w, new_h))
-    
-    # パディングして正方形に
-    padded = np.full((input_size, input_size, 3), 114, dtype=np.uint8)
-    padded[:new_h, :new_w] = resized
-    
-    # BGR→RGB, HWC→CHW, 正規化
-    blob = padded[:, :, ::-1].transpose(2, 0, 1).astype(np.float32) / 255.0
-    blob = np.expand_dims(blob, axis=0)
-    return blob, scale, 0, 0  # pad_x, pad_y は0（左上寄せ）
-
-def nms(boxes, scores, iou_threshold=0.45):
-    """Non-Maximum Suppression"""
-    if len(boxes) == 0:
-        return []
-    
-    x1 = boxes[:, 0]
-    y1 = boxes[:, 1]
-    x2 = boxes[:, 2]
-    y2 = boxes[:, 3]
-    areas = (x2 - x1) * (y2 - y1)
-    order = scores.argsort()[::-1]
-    
-    keep = []
-    while order.size > 0:
-        i = order[0]
-        keep.append(i)
-        
-        xx1 = np.maximum(x1[i], x1[order[1:]])
-        yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]])
-        yy2 = np.minimum(y2[i], y2[order[1:]])
-        
-        inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
-        iou = inter / (areas[i] + areas[order[1:]] - inter)
-        
-        inds = np.where(iou <= iou_threshold)[0]
-        order = order[inds + 1]
-    
-    return keep
-
-def postprocess(output, scale, orig_w, orig_h, conf_threshold=0.5, iou_threshold=0.45):
-    """YOLOv8出力を処理して顔バウンディングボックスを返す"""
-    # output shape: (1, 5, 8400) → transpose → (8400, 5) : [cx, cy, w, h, conf]
-    predictions = output[0].transpose()
-    
-    # 信頼度フィルタ
-    scores = predictions[:, 4]
-    mask = scores > conf_threshold
-    predictions = predictions[mask]
-    scores = scores[mask]
-    
-    if len(predictions) == 0:
-        return []
-    
-    # cx, cy, w, h → x1, y1, x2, y2
-    cx, cy, w, h = predictions[:, 0], predictions[:, 1], predictions[:, 2], predictions[:, 3]
-    x1 = cx - w / 2
-    y1 = cy - h / 2
-    x2 = cx + w / 2
-    y2 = cy + h / 2
-    
-    boxes = np.stack([x1, y1, x2, y2], axis=1)
-    
-    # NMS
-    keep = nms(boxes, scores, iou_threshold)
-    boxes = boxes[keep]
-    
-    # スケールを元画像サイズに戻す
-    boxes[:, [0, 2]] = boxes[:, [0, 2]] / scale
-    boxes[:, [1, 3]] = boxes[:, [1, 3]] / scale
-    
-    # クリッピング
-    boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, orig_w)
-    boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, orig_h)
-    
-    return boxes.astype(int)
-
 # --- マスク画像の読み込み ---
 def load_mask(name):
     """マスク画像を 8bit BGRA で返す。使えないときは None（呼び出し側はぼかしで代用する）。"""
@@ -371,10 +256,11 @@ def _camera_loop():
         loaded_mask_name = config.current_mask_name
         overlay_img = load_mask(loaded_mask_name)
 
-        # ONNX Runtimeセッション作成
+        # 顔検出（YuNet / OpenCV DNN・CPU）の準備。起動時に一度ダミー画像で動作確認もする
         try:
-            session = create_onnx_session(MODEL_PATH)
-            input_name = session.get_inputs()[0].name
+            detector = FaceDetector(MODEL_PATH)
+            config.provider_name = "YuNet (OpenCV DNN / CPU)"
+            log.info("顔検出の準備完了: %s (OpenCV %s)", config.provider_name, cv2.__version__)
         except Exception as e:
             config.error_detail = f"{type(e).__name__}: {e}"
             config.startup_error = "model"
@@ -442,11 +328,10 @@ def _camera_loop():
             now = time.time()
             infer_wait = config.infer_interval if detector_ok else DETECTOR_RETRY_SECONDS
             if now - last_infer_time > infer_wait:
-                # ONNX推論。失敗したら顔の位置が分からないので、画面全体をぼかす側に倒す
+                # 顔検出。失敗したら顔の位置が分からないので、画面全体をぼかす側に倒す
+                # （ランドマークと信頼度も返るが、いまのマスク合成は bbox だけを使う）
                 try:
-                    blob, scale, _, _ = preprocess(frame, 640)
-                    output = session.run(None, {input_name: blob})[0]
-                    boxes = postprocess(output, scale, frame.shape[1], frame.shape[0])
+                    boxes, _landmarks, _scores = detector.detect(frame)
                     if not detector_ok:
                         log.info("顔検出が復帰しました")
                     detector_ok = True
@@ -814,13 +699,10 @@ class ControlApp(ctk.CTk):
 
     def _poll_status(self):
         """camera_threadの状態（推論方法・エラー・マスクの適用状態）を画面へ反映し続ける"""
-        # 推論方法（確定したら一度だけ）
+        # 顔検出の方式（準備できたら一度だけ）
         if config.provider_name and not self._provider_shown:
             self._provider_shown = True
-            if "Dml" in config.provider_name:
-                self.label_provider.configure(text="✅ GPU推論 (DirectML)", text_color="#2d8659")
-            else:
-                self.label_provider.configure(text="⚠ CPU推論（低速）", text_color="#9e6b2b")
+            self.label_provider.configure(text=f"✅ 顔検出: {config.provider_name}", text_color="#2d8659")
 
         # エラー（起動時だけでなく、動作中に止まった場合も出す）
         if config.startup_error and self.label_error is None:

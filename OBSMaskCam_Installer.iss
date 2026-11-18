@@ -33,8 +33,10 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 ; EXEファイルと_internalフォルダの中身をすべてコピー
 Source: "dist\OBSMaskCam\OBSMaskCam.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\OBSMaskCam\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
-; マスクフォルダもコピー
-Source: "masks\*"; DestDir: "{app}\masks"; Flags: ignoreversion recursesubdirs createallsubdirs
+; 同梱する初期マスクは、git で追跡している default_masks\ の画像だけ。
+; masks\ は開発者の手元の画像置き場（.gitignore 対象）なので、配布物には入れない。
+; default_masks\ に画像が無くてもビルドできる（初期マスクはアプリが icon.ico から作る）。
+Source: "default_masks\*.png"; DestDir: "{app}\masks"; Flags: ignoreversion skipifsourcedoesntexist
 ; アイコン
 Source: "icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 

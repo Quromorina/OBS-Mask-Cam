@@ -16,10 +16,13 @@ if getattr(sys, 'frozen', False):
 import onnxruntime as ort
 import time
 import threading
+import logging
+import logging.handlers
 import customtkinter as ctk
 import shutil
 from tkinter import filedialog, messagebox
 from PIL import Image
+from mask_safety import normalize_mask_image, fit_frame, obscure_frame, cover_face
 try:
     from pygrabber.dshow_graph import FilterGraph
     HAS_PYGRABBER = True
@@ -53,12 +56,36 @@ if IS_FROZEN:
 else:
     # 通常のPython実行
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
+    BUNDLE_DIR = APP_DIR
 MODEL_PATH = os.path.join(BUNDLE_DIR, "yolov8n-face.onnx")
 
 # 共有データ（ユーザーごとのAppData\Roamingに保存）
 USER_DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "OBSMaskCam")
 MASK_DIR = os.path.join(USER_DATA_DIR, "masks")
 APP_MASK_DIR = os.path.join(APP_DIR, "masks")
+LOG_PATH = os.path.join(USER_DATA_DIR, "app.log")
+
+# --- ログ（EXEはコンソールが無いので、原因を追えるようファイルにも残す） ---
+def setup_logging():
+    logger = logging.getLogger("obsmaskcam")
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    if sys.stderr is not None:
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+    try:
+        os.makedirs(USER_DATA_DIR, exist_ok=True)
+        file_handler = logging.handlers.RotatingFileHandler(
+            LOG_PATH, maxBytes=1_000_000, backupCount=2, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except Exception as e:
+        print(f"ログファイルを開けません: {e}")
+    return logger
+
+log = setup_logging()
+log.info("起動: APP_DIR=%s MODEL_PATH=%s (exists=%s)", APP_DIR, MODEL_PATH, os.path.exists(MODEL_PATH))
 
 print(f"📁 APP_DIR: {APP_DIR}")
 print(f"📁 BUNDLE_DIR: {BUNDLE_DIR}")
@@ -81,7 +108,11 @@ class AppConfig:
     camera_list = []
     camera_mapping = {}          # カメラ名 -> システムIndexの対応
     provider_name = ""           # GPU/CPU表示用
-    startup_error = ""           # 起動時エラーメッセージ
+    startup_error = ""           # エラー種別: camera / virtualcam / model / internal
+    error_detail = ""            # 画面に出すエラーの理由
+    face_hold_seconds = 1.5      # 顔を見失ってからマスクをその場に残す秒数
+    # 現在の送出状態: starting / ok / fallback / detector_error / off / no_camera / stopped
+    mask_status = "starting"
 
 config = AppConfig()
 
@@ -179,7 +210,14 @@ def create_onnx_session(model_path):
         providers.append('DmlExecutionProvider')
     providers.append('CPUExecutionProvider')
     
-    session = ort.InferenceSession(model_path, providers=providers)
+    try:
+        session = ort.InferenceSession(model_path, providers=providers)
+    except Exception:
+        if providers == ['CPUExecutionProvider']:
+            raise
+        # DirectMLで作れない環境（ドライバ不整合など）はCPUでやり直す
+        log.exception("DirectML でのセッション作成に失敗しました。CPU で再試行します")
+        session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
     active_provider = session.get_providers()[0]
     config.provider_name = active_provider
     print(f"✅ Using provider: {active_provider}")
@@ -268,92 +306,96 @@ def postprocess(output, scale, orig_w, orig_h, conf_threshold=0.5, iou_threshold
     
     return boxes.astype(int)
 
-# --- アルファ合成 ---
-def overlay_transparent(background, overlay, x, y):
-    if overlay.shape[2] != 4:
-        # アルファチャンネルがない場合は単に上書き（安全策）
-        h, w = overlay.shape[:2]
-        bh, bw = background.shape[:2]
-        x1, y1 = max(x, 0), max(y, 0)
-        x2, y2 = min(x + w, bw), min(y + h, bh)
-        if x1 >= x2 or y1 >= y2: return background
-        overlay_rgb = overlay[:, :, :3]
-        background[y1:y2, x1:x2] = overlay_rgb[0:y2-y1, 0:x2-x1]
-        return background
+# --- マスク画像の読み込み ---
+def load_mask(name):
+    """マスク画像を 8bit BGRA で返す。使えないときは None（呼び出し側はぼかしで代用する）。"""
+    if not name:
+        log.warning("マスクが選択されていません。ぼかしで代用します")
+        return None
+    path = os.path.join(MASK_DIR, name)
+    if not os.path.exists(path):
+        log.warning("マスクファイルが見つかりません: %s", path)
+        return None
+    img = normalize_mask_image(imread_safe(path, cv2.IMREAD_UNCHANGED))
+    if img is None:
+        log.warning("マスク画像を読み込めません: %s", path)
+        return None
+    if img[:, :, 3].max() == 0:
+        log.warning("マスク画像が完全に透明です（顔を隠せません）: %s", path)
+        return None
+    log.info("マスク読み込み成功: %s %s", name, img.shape)
+    return img
 
-    h, w = overlay.shape[:2]
-    bh, bw = background.shape[:2]
-    x1, y1 = max(x, 0), max(y, 0)
-    x2, y2 = min(x + w, bw), min(y + h, bh)
-    overlay_x1, overlay_y1 = max(0, -x), max(0, -y)
-    overlay_x2 = overlay_x1 + (x2 - x1)
-    overlay_y2 = overlay_y1 + (y2 - y1)
-    if x1 >= x2 or y1 >= y2:
-        return background
-    overlay_crop = overlay[overlay_y1:overlay_y2, overlay_x1:overlay_x2]
-    b, g, r, a = cv2.split(overlay_crop)
-    mask = cv2.merge((a, a, a))
-    overlay_rgb = cv2.merge((b, g, r))
-    roi = background[y1:y2, x1:x2]
-    img1_bg = cv2.bitwise_and(roi, 255 - mask)
-    img2_fg = cv2.bitwise_and(overlay_rgb, mask)
-    background[y1:y2, x1:x2] = cv2.add(img1_bg, img2_fg)
-    return background
+# --- カメラを開く ---
+def open_camera(index):
+    cap = cv2.VideoCapture(index, cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
+    if cap.isOpened():
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.height)
+        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if (actual_w, actual_h) != (config.width, config.height):
+            # 要求どおりの解像度にならないカメラ。毎フレーム fit_frame で出力サイズへ合わせる
+            log.warning("カメラ(Index %s)の実解像度は %sx%s です。%sx%s に合わせて送出します",
+                        index, actual_w, actual_h, config.width, config.height)
+    return cap
+
+# 顔検出が失敗したときに再試行する間隔（秒）
+DETECTOR_RETRY_SECONDS = 1.0
 
 # --- カメラ・AI処理スレッド ---
 def camera_thread():
+    """スレッドの入口。想定外の例外でも黙って終わらせず、理由を画面とログに残す。"""
+    try:
+        _camera_loop()
+    except Exception as e:
+        log.exception("映像処理スレッドが例外で停止しました")
+        if not config.startup_error:
+            config.error_detail = f"{type(e).__name__}: {e}"
+            config.startup_error = "internal"
+    finally:
+        config.mask_status = "stopped"
+
+def _camera_loop():
     # カメラ確認
-    cap = cv2.VideoCapture(config.camera_index, cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
+    cap = open_camera(config.camera_index)
     if not cap.isOpened():
         config.startup_error = "camera"
-        print("❌ カメラが見つかりません")
-        return
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.height)
-    last_camera_index = config.camera_index
-
-    def load_mask(name):
-        if not name:
-            print("⚠ マスク名が空です")
-            return None
-        path = os.path.join(MASK_DIR, name)
-        if not os.path.exists(path):
-            print(f"⚠ マスクファイルが見つかりません: {path}")
-            return None
-        img = imread_safe(path, cv2.IMREAD_UNCHANGED)
-        if img is None:
-            print(f"⚠ マスク画像の読み込み失敗: {path}")
-            return None
-        
-        if len(img.shape) == 2: # グレースケール
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
-        elif img.shape[2] == 3: # BGR
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
-        print(f"✅ マスク読み込み成功: {name} ({img.shape})")
-        return img
-
-    overlay_img = load_mask(config.current_mask_name)
-    loaded_mask_name = config.current_mask_name
-
-    # ONNX Runtimeセッション作成
-    session = create_onnx_session(MODEL_PATH)
-    input_name = session.get_inputs()[0].name
-
-    face_history = {}
-    last_infer_time = 0
-
-    # Virtual Camera接続
-    try:
-        cam = pyvirtualcam.Camera(width=config.width, height=config.height, fps=config.fps, fmt=PixelFormat.BGR)
-    except Exception as e:
-        config.startup_error = "virtualcam"
-        print(f"❌ OBS Virtual Cameraが見つかりません: {e}")
+        log.error("カメラが見つかりません (Index %s)", config.camera_index)
         cap.release()
         return
-
-    print(f'✅ Virtual camera started: {cam.device}')
+    last_camera_index = config.camera_index
+    cam = None
 
     try:
+        loaded_mask_name = config.current_mask_name
+        overlay_img = load_mask(loaded_mask_name)
+
+        # ONNX Runtimeセッション作成
+        try:
+            session = create_onnx_session(MODEL_PATH)
+            input_name = session.get_inputs()[0].name
+        except Exception as e:
+            config.error_detail = f"{type(e).__name__}: {e}"
+            config.startup_error = "model"
+            log.exception("顔検出モデルを読み込めません: %s", MODEL_PATH)
+            return
+
+        face_history = {}
+        last_infer_time = 0
+        detector_ok = True
+
+        # Virtual Camera接続
+        try:
+            cam = pyvirtualcam.Camera(width=config.width, height=config.height, fps=config.fps, fmt=PixelFormat.BGR)
+        except Exception as e:
+            config.startup_error = "virtualcam"
+            config.error_detail = f"{type(e).__name__}: {e}"
+            log.exception("OBS Virtual Camera に接続できません")
+            return
+
+        log.info("Virtual camera started: %s", cam.device)
+
         while config.running:
             # カメラソースの切り替えチェック
             if last_camera_index != config.camera_index:
@@ -369,10 +411,8 @@ def camera_thread():
                 cap.release()
                 time.sleep(0.5) # リソース解放を待機
                 
-                cap = cv2.VideoCapture(config.camera_index, cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.width)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.height)
                 last_camera_index = config.camera_index
+                cap = open_camera(last_camera_index)
                 continue
 
             # マスクリストの更新チェック
@@ -381,29 +421,42 @@ def camera_thread():
                 config.need_reload_list = False
 
             # マスクの切り替え判定
+            # 読み込めなかった場合は古いマスクを出し続けず、ぼかしで代用する（overlay_img = None）
             if loaded_mask_name != config.current_mask_name:
-                new_img = load_mask(config.current_mask_name)
-                if new_img is not None:
-                    overlay_img = new_img
-                    loaded_mask_name = config.current_mask_name
+                loaded_mask_name = config.current_mask_name
+                overlay_img = load_mask(loaded_mask_name)
 
             ret, frame = cap.read()
-            if not ret:
+            # カメラの実解像度が出力サイズと違っても、ここで必ず width x height に揃える
+            frame = fit_frame(frame, config.width, config.height) if ret else None
+            if frame is None:
                 # カメラからフレーム取得失敗 → 黒画面を送る
                 frame = np.zeros((config.height, config.width, 3), dtype=np.uint8)
                 cv2.putText(frame, "Camera not available", (config.width//4, config.height//2),
                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 2)
+                config.mask_status = "no_camera"
                 cam.send(frame)
                 cam.sleep_until_next_frame()
                 continue
 
             now = time.time()
-            if now - last_infer_time > config.infer_interval:
-                # ONNX推論
-                blob, scale, _, _ = preprocess(frame, 640)
-                output = session.run(None, {input_name: blob})[0]
-                boxes = postprocess(output, scale, frame.shape[1], frame.shape[0])
-                
+            infer_wait = config.infer_interval if detector_ok else DETECTOR_RETRY_SECONDS
+            if now - last_infer_time > infer_wait:
+                # ONNX推論。失敗したら顔の位置が分からないので、画面全体をぼかす側に倒す
+                try:
+                    blob, scale, _, _ = preprocess(frame, 640)
+                    output = session.run(None, {input_name: blob})[0]
+                    boxes = postprocess(output, scale, frame.shape[1], frame.shape[0])
+                    if not detector_ok:
+                        log.info("顔検出が復帰しました")
+                    detector_ok = True
+                except Exception:
+                    if detector_ok:
+                        log.exception("顔検出に失敗しました。復帰するまで画面全体をぼかします")
+                    detector_ok = False
+                    boxes = []
+
+
                 current_faces = []
                 for box in boxes:
                     x1, y1, x2, y2 = box
@@ -440,7 +493,7 @@ def camera_thread():
                 for fid, data in face_history.items():
                     if fid in matched_old_ids or fid in new_face_history:
                         continue
-                    if now - data["last_update"] < 0.5:
+                    if now - data["last_update"] < config.face_hold_seconds:
                         ghost_cx, ghost_cy, _ = data["history"][-1]
                         near_current = any(
                             np.sqrt((cx - ghost_cx)**2 + (cy - ghost_cy)**2) < config.distance_threshold * 3
@@ -452,7 +505,13 @@ def camera_thread():
                 face_history = new_face_history
                 last_infer_time = now
 
-            if config.mask_enabled and overlay_img is not None:
+            if not config.mask_enabled:
+                status = "off"
+            elif not detector_ok:
+                frame = obscure_frame(frame)
+                status = "detector_error"
+            else:
+                status = "ok" if overlay_img is not None else "fallback"
                 for fid, data in face_history.items():
                     history = data["history"]
                     current_history = history[-config.smooth_frames:]
@@ -494,27 +553,46 @@ def camera_thread():
                     else:
                         avg_fs = latest_fs
 
-                    try:
-                        resized = cv2.resize(overlay_img, (avg_fs, avg_fs))
-                        x_offset = avg_cx - avg_fs // 2
-                        y_offset = avg_cy - avg_fs // 2
-                        frame = overlay_transparent(frame, resized, x_offset, y_offset)
-                    except cv2.error:
-                        continue
+                    # マスク画像を重ねられないときは、その顔をモザイクで潰す（素通しにしない）
+                    frame, used_mask = cover_face(frame, overlay_img, avg_cx, avg_cy, avg_fs)
+                    if not used_mask:
+                        status = "fallback"
+
+            if status != config.mask_status:
+                log.info("送出状態: %s -> %s", config.mask_status, status)
+                config.mask_status = status
 
             cam.send(frame)
             cam.sleep_until_next_frame()
     finally:
-        cam.close()
+        if cam is not None:
+            cam.close()
         cap.release()
 
 # --- GUIクラス ---
 class ControlApp(ctk.CTk):
+    # config.mask_status -> (表示文言, 背景色)
+    MASK_STATUS_UI = {
+        "starting":       ("⏳ 起動中...", "#5a5a5a"),
+        "ok":             ("✅ マスク適用中", "#2d8659"),
+        "fallback":       ("⚠ マスク画像が使えないため、ぼかしで顔を隠しています", "#9e6b2b"),
+        "detector_error": ("⚠ 顔検出が止まっているため、画面全体をぼかしています", "#9e6b2b"),
+        "off":            ("🚫 マスクOFF：素顔がそのまま映ります", "#c0392b"),
+        "no_camera":      ("⚠ カメラ映像なし（黒画面を送出中）", "#5a5a5a"),
+        "stopped":        ("❌ 映像の送出が止まっています", "#c0392b"),
+    }
+    ERROR_TEXT = {
+        "virtualcam": "❌ OBS Virtual Cameraが見つかりません\nOBS Studioをインストールしてください",
+        "camera": "❌ カメラが見つかりません\nWebカメラを接続してください",
+        "model": "❌ 顔検出モデルを読み込めませんでした",
+        "internal": "❌ 映像処理がエラーで停止しました",
+    }
+
     def __init__(self):
         super().__init__()
 
         self.title("OBS Mask Cam - コントロールパネル")
-        self.geometry("450x850")
+        self.geometry("450x940")
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
@@ -536,11 +614,20 @@ class ControlApp(ctk.CTk):
         self.label_provider = ctk.CTkLabel(self.status_frame, text="⏳ 起動中...", 
                                            font=self.font_small, text_color="#888888")
         self.label_provider.pack(pady=5)
-        
+
+        # いま顔が隠れているかどうかを、常に目立つ形で出す
+        self.label_mask_status = ctk.CTkLabel(self.status_frame, text=self.MASK_STATUS_UI["starting"][0],
+                                              font=self.font_bold, text_color="#ffffff",
+                                              fg_color=self.MASK_STATUS_UI["starting"][1],
+                                              corner_radius=6, height=40, wraplength=380)
+        self.label_mask_status.pack(pady=(0, 8), padx=10, fill="x")
+        self._shown_mask_status = "starting"
+        self._provider_shown = False
+
         self.label_error = None
-        
-        # provider情報をポーリングで更新
-        self._poll_provider_status()
+
+        # 推論方法・エラー・マスクの適用状態をポーリングで更新
+        self._poll_status()
 
 
         # --- カメラ選択エリア ---
@@ -596,6 +683,13 @@ class ControlApp(ctk.CTk):
         self.slider_scale.set(config.scale)
         self.slider_scale.pack(padx=20, pady=(0, 10), fill="x")
 
+        # 検出が途切れたとき、マスクをその場に残しておく時間（長いほど素顔が出にくい）
+        self.label_hold = ctk.CTkLabel(self.settings_frame, font=self.font_main,
+                                       text=f"顔を見失ったときのマスク保持: {config.face_hold_seconds:.1f} 秒")
+        self.label_hold.pack(pady=(5, 0))
+        self.slider_hold = ctk.CTkSlider(self.settings_frame, from_=0.5, to=5.0, number_of_steps=9, command=self.update_hold)
+        self.slider_hold.set(config.face_hold_seconds)
+        self.slider_hold.pack(padx=20, pady=(0, 10), fill="x")
 
 
         # 終了ボタン
@@ -627,14 +721,12 @@ class ControlApp(ctk.CTk):
         if file_path:
             try:
                 # 画像を読み込んでチャンネル数を確認
-                img = imread_safe(file_path, cv2.IMREAD_UNCHANGED)
-                if img is None: return
+                # 8bit BGRA に正規化（16bit PNG などをそのまま保存しない）
+                img = normalize_mask_image(imread_safe(file_path, cv2.IMREAD_UNCHANGED))
+                if img is None:
+                    messagebox.showerror("追加できません", "この画像は読み込めませんでした。PNG / JPG などの別の画像を選んでください。")
+                    return
 
-                if len(img.shape) == 2: # グレースケール
-                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
-                elif img.shape[2] == 3: # BGR
-                    img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
-                
                 # --- 画像が巨大すぎる場合は縮小する ---
                 MAX_MASK_SIZE = 1000
                 h, w = img.shape[:2]
@@ -716,35 +808,41 @@ class ControlApp(ctk.CTk):
         config.scale = val
         self.label_scale.configure(text=f"マスクの大きさ: {config.scale:.1f}")
 
+    def update_hold(self, val):
+        config.face_hold_seconds = round(float(val), 1)
+        self.label_hold.configure(text=f"顔を見失ったときのマスク保持: {config.face_hold_seconds:.1f} 秒")
 
-
-    def _poll_provider_status(self):
-        """camera_threadのprovider情報が確定するまでポーリング"""
-        if config.provider_name:
-            # provider確定 → 表示更新
+    def _poll_status(self):
+        """camera_threadの状態（推論方法・エラー・マスクの適用状態）を画面へ反映し続ける"""
+        # 推論方法（確定したら一度だけ）
+        if config.provider_name and not self._provider_shown:
+            self._provider_shown = True
             if "Dml" in config.provider_name:
                 self.label_provider.configure(text="✅ GPU推論 (DirectML)", text_color="#2d8659")
             else:
                 self.label_provider.configure(text="⚠ CPU推論（低速）", text_color="#9e6b2b")
-            return
-        
-        if config.startup_error:
-            # エラー発生
-            self.label_provider.configure(text="⚠ CPU推論（低速）", text_color="#9e6b2b")
-            if config.startup_error == "virtualcam":
-                self.label_error = ctk.CTkLabel(self.status_frame, 
-                    text="❌ OBS Virtual Cameraが見つかりません\nOBS Studioをインストールしてください", 
-                    font=self.font_small, text_color="#e74c3c", wraplength=380)
-                self.label_error.pack(pady=5)
-            elif config.startup_error == "camera":
-                self.label_error = ctk.CTkLabel(self.status_frame, 
-                    text="❌ カメラが見つかりません\nWebカメラを接続してください", 
-                    font=self.font_small, text_color="#e74c3c", wraplength=380)
-                self.label_error.pack(pady=5)
-            return
-        
-        # まだ確定してない → 500ms後に再チェック
-        self.after(500, self._poll_provider_status)
+
+        # エラー（起動時だけでなく、動作中に止まった場合も出す）
+        if config.startup_error and self.label_error is None:
+            if not config.provider_name:
+                self.label_provider.configure(text="❌ 起動できませんでした", text_color="#e74c3c")
+            text = self.ERROR_TEXT.get(config.startup_error, self.ERROR_TEXT["internal"])
+            if config.startup_error in ("model", "internal"):
+                if config.error_detail:
+                    text += f"\n{config.error_detail[:200]}"
+                text += f"\nログ: {LOG_PATH}"
+            self.label_error = ctk.CTkLabel(self.status_frame, text=text,
+                font=self.font_small, text_color="#e74c3c", wraplength=380)
+            self.label_error.pack(pady=5)
+
+        # マスクの適用状態
+        status = config.mask_status
+        if status != self._shown_mask_status:
+            self._shown_mask_status = status
+            text, color = self.MASK_STATUS_UI.get(status, self.MASK_STATUS_UI["stopped"])
+            self.label_mask_status.configure(text=text, fg_color=color)
+
+        self.after(300, self._poll_status)
 
     def on_closing(self):
         config.running = False

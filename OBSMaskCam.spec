@@ -50,7 +50,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,  # UPX圧縮はウイルス対策ソフトの誤検知を招きやすいため使わない
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -65,7 +65,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,  # UPX圧縮はウイルス対策ソフトの誤検知を招きやすいため使わない
     upx_exclude=[],
     name='OBSMaskCam',
 )

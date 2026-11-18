@@ -152,7 +152,15 @@ def cover_face(frame, overlay, cx, cy, size):
     どの経路でも「何もせずに返す」ことはしない。
     """
     cx, cy, size = int(cx), int(cy), int(size)
-    if overlay is not None and size > 0:
+    # 8bit BGRA 以外（16bit・アルファなし等）は合成せずモザイクにする。
+    # 環境によっては cv2 が例外を出さずに崩れた合成をするため、例外頼みにしない。
+    usable = (
+        overlay is not None
+        and getattr(overlay, "dtype", None) == np.uint8
+        and getattr(overlay, "ndim", 0) == 3
+        and overlay.shape[2] == 4
+    )
+    if usable and size > 0:
         try:
             resized = cv2.resize(overlay, (size, size))
             frame = overlay_transparent(frame, resized, cx - size // 2, cy - size // 2)

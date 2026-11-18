@@ -1,3 +1,3 @@
 -r requirements.txt
-# EXE のビルド用
+# EXE のビルド用（pyinstaller OBSMaskCam.spec）
 pyinstaller==6.22.2

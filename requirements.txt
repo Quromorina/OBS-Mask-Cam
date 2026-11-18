@@ -1,11 +1,10 @@
-# 実行に必要なもの（main.py が import しているもの）。版は main の既存の固定に合わせる。
-# torch / ultralytics などの学習・旧推論系は main.py で使っていないため外した（exe も .spec で除外済み）。
+# 実行に必要なもの（main.py / face_detector.py / mask_safety.py が import しているもの）。
+# 顔検出は OpenCV の cv2.FaceDetectorYN（YuNet）で行うため、onnxruntime・torch・ultralytics は不要。
 opencv-python==4.13.0.92
 numpy==2.4.2
-onnxruntime-directml==1.24.4
 pyvirtualcam==0.15.0
 customtkinter==5.2.2
 pillow==13.0.0
-# Windows のカメラ名取得
+# Windows のカメラ名取得（無くても起動はする。comtypes は pygrabber が使う）
 pygrabber==0.2; sys_platform == "win32"
 comtypes==1.4.15; sys_platform == "win32"

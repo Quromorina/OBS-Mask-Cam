@@ -1,9 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_data_files
 import os
-
-# onnxruntime の DLL を収集
-ort_binaries = collect_dynamic_libs('onnxruntime')
 
 # customtkinter のテーマデータを収集
 ctk_datas = collect_data_files('customtkinter')
@@ -11,12 +8,14 @@ ctk_datas = collect_data_files('customtkinter')
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=ort_binaries,
+    binaries=[],
     datas=[
-        ('yolov8n-face.onnx', '.'),          # ONNXモデル
+        # 顔検出モデル（YuNet / OpenCV Zoo, MIT License）。推論は OpenCV の DNN で行う
+        ('face_detection_yunet_2023mar.onnx', '.'),
+        # モデルのライセンス文（MIT の条件として配布物に同梱する）
+        ('licenses/YuNet-LICENSE.txt', 'licenses'),
     ] + ctk_datas,
     hiddenimports=[
-        'onnxruntime',
         'customtkinter',
         'pyvirtualcam',
         'pygrabber',
@@ -31,6 +30,7 @@ a = Analysis(
     excludes=[
         'torch', 'torchvision', 'torchaudio',
         'ultralytics',
+        'onnxruntime',  # 顔検出は OpenCV の DNN に移したので不要（環境に残っていても同梱しない）
         'mediapipe',
         'matplotlib', 'scipy', 'polars',
         'numpy.f2py', 'pandas',
@@ -50,7 +50,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,  # UPX圧縮はウイルス対策ソフトの誤検知を招きやすいため使わない
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -65,7 +65,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,  # UPX圧縮はウイルス対策ソフトの誤検知を招きやすいため使わない
     upx_exclude=[],
     name='OBSMaskCam',
 )

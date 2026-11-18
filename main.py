@@ -12,7 +12,8 @@ import customtkinter as ctk
 import shutil
 from tkinter import filedialog, messagebox
 from PIL import Image
-from mask_safety import normalize_mask_image, fit_frame, obscure_frame, cover_face
+from mask_safety import (normalize_mask_image, fit_frame, obscure_frame, cover_face,
+                         decide_mask_status, save_mask_png)
 from face_detector import FaceDetector, MODEL_FILENAME
 try:
     from pygrabber.dshow_graph import FilterGraph
@@ -28,15 +29,6 @@ def imread_safe(path, flags=cv2.IMREAD_UNCHANGED):
         return cv2.imdecode(buf, flags)
     except Exception:
         return None
-
-def imwrite_safe(path, img):
-    """日本語パスでも保存できるcv2.imwrite代替"""
-    ext = os.path.splitext(path)[1]
-    result, buf = cv2.imencode(ext, img)
-    if result:
-        buf.tofile(path)
-        return True
-    return False
 
 # --- パス解決（EXE対応） ---
 IS_FROZEN = getattr(sys, 'frozen', False)
@@ -390,13 +382,13 @@ def _camera_loop():
                 face_history = new_face_history
                 last_infer_time = now
 
+            all_masks_applied = True
+            covered_faces = 0
             if not config.mask_enabled:
-                status = "off"
+                pass
             elif not detector_ok:
                 frame = obscure_frame(frame)
-                status = "detector_error"
             else:
-                status = "ok" if overlay_img is not None else "fallback"
                 for fid, data in face_history.items():
                     history = data["history"]
                     current_history = history[-config.smooth_frames:]
@@ -440,8 +432,13 @@ def _camera_loop():
 
                     # マスク画像を重ねられないときは、その顔をモザイクで潰す（素通しにしない）
                     frame, used_mask = cover_face(frame, overlay_img, avg_cx, avg_cy, avg_fs)
+                    covered_faces += 1
                     if not used_mask:
-                        status = "fallback"
+                        all_masks_applied = False
+
+            # 顔が 0 件のときは「マスク適用中」ではなく「顔未検出」と出す
+            status = decide_mask_status(config.mask_enabled, detector_ok, overlay_img is not None,
+                                        covered_faces, all_masks_applied)
 
             if status != config.mask_status:
                 log.info("送出状態: %s -> %s", config.mask_status, status)
@@ -460,6 +457,8 @@ class ControlApp(ctk.CTk):
     MASK_STATUS_UI = {
         "starting":       ("⏳ 起動中...", "#5a5a5a"),
         "ok":             ("✅ マスク適用中", "#2d8659"),
+        "no_face":        ("👤 顔未検出（隠す対象の顔が見つかっていません）", "#3a6ea5"),
+        "no_face_fallback": ("⚠ 顔未検出・マスク画像なし（顔が映ったら、ぼかしで隠します）", "#9e6b2b"),
         "fallback":       ("⚠ マスク画像が使えないため、ぼかしで顔を隠しています", "#9e6b2b"),
         "detector_error": ("⚠ 顔検出が止まっているため、画面全体をぼかしています", "#9e6b2b"),
         "off":            ("🚫 マスクOFF：素顔がそのまま映ります", "#c0392b"),
@@ -627,7 +626,16 @@ class ControlApp(ctk.CTk):
                 new_file_name = f"{base_name}.png"
                 dest_path = os.path.join(MASK_DIR, new_file_name)
                 
-                imwrite_safe(dest_path, img)
+                # 保存できたことを確かめてから、一覧の更新と選択の切り替えに進む
+                if not save_mask_png(dest_path, img):
+                    log.error("マスク画像を保存できませんでした: %s", dest_path)
+                    messagebox.showerror(
+                        "保存できませんでした",
+                        f"マスク画像「{new_file_name}」を保存できませんでした。\n"
+                        "保存先のフォルダに書き込めるか、空き容量があるかを確認してください。\n"
+                        f"保存先: {MASK_DIR}\n\n"
+                        "いま選択中のマスクは変更していません。")
+                    return
                 print(f"✅ 画像を透過対応PNGとして保存しました: {new_file_name}")
 
                 config.need_reload_list = True
@@ -637,7 +645,8 @@ class ControlApp(ctk.CTk):
                 self.option_mask.set(new_file_name)
                 self.update_mask_choice(new_file_name)
             except Exception as e:
-                print(f"Error adding file: {e}")
+                log.exception("マスク画像の追加に失敗しました")
+                messagebox.showerror("追加できませんでした", f"マスク画像の追加中にエラーが起きました。\n{e}")
 
     def delete_mask_file(self):
         current = config.current_mask_name

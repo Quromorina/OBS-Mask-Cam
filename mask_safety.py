@@ -3,6 +3,8 @@
 GUI・カメラ・ONNX Runtime に依存しない純粋な関数だけを置き、
 tests/test_mask_safety.py から単体で確認できるようにしている。
 """
+import os
+
 import cv2
 import numpy as np
 
@@ -13,6 +15,12 @@ MOSAIC_BLOCKS = 8
 FULL_FRAME_BLOCKS = (16, 9)
 # モザイク処理自体が失敗したときの塗りつぶし色（BGR）
 FILL_COLOR = (64, 64, 64)
+# 顔を隠す領域の一辺の下限（px）。検出結果のサイズが 0〜数 px でも、
+# 「何も隠さない」「1px だけ隠す」にならないよう、ここまで広げる。
+MIN_COVER_SIZE = 16
+# モザイク 1 ブロックの一辺の下限（px）。領域が小さいときはブロック数を減らす。
+# （8px の領域を 8 ブロックに潰しても元の画素のままで、隠したことにならないため）
+MIN_BLOCK_PX = 4
 
 
 def normalize_mask_image(img):
@@ -89,20 +97,27 @@ def fit_frame(frame, width, height):
 
 
 def obscure_region(frame, cx, cy, size):
-    """(cx, cy) を中心とする一辺 size の正方形を、判別できない粗さのモザイクで潰す。"""
-    cx, cy, size = int(cx), int(cy), int(size)
+    """(cx, cy) を中心とする一辺 size の正方形を、判別できない粗さのモザイクで潰す。
+
+    size が MIN_COVER_SIZE より小さい（0 や負の値を含む）ときは MIN_COVER_SIZE に広げる。
+    何もせずに返すのは、領域が完全に画面の外にあるときだけ。
+    """
+    cx, cy = int(cx), int(cy)
+    size = max(int(size), MIN_COVER_SIZE)
     half = size // 2
-    if half <= 0:
-        return frame
 
     h, w = frame.shape[:2]
     x1, y1 = max(cx - half, 0), max(cy - half, 0)
-    x2, y2 = min(cx + half, w), min(cy + half, h)
+    x2, y2 = min(cx - half + size, w), min(cy - half + size, h)
     if x1 >= x2 or y1 >= y2:
         return frame
 
     try:
-        small = cv2.resize(frame[y1:y2, x1:x2], (MOSAIC_BLOCKS, MOSAIC_BLOCKS),
+        # 領域が小さい（または画面端で切れて細い）ときはブロック数を減らし、
+        # 1 ブロックが MIN_BLOCK_PX 未満にならないようにする。最小は 1 ブロック（平均色で塗る）。
+        blocks_x = max(1, min(MOSAIC_BLOCKS, (x2 - x1) // MIN_BLOCK_PX))
+        blocks_y = max(1, min(MOSAIC_BLOCKS, (y2 - y1) // MIN_BLOCK_PX))
+        small = cv2.resize(frame[y1:y2, x1:x2], (blocks_x, blocks_y),
                            interpolation=cv2.INTER_AREA)
         frame[y1:y2, x1:x2] = cv2.resize(small, (x2 - x1, y2 - y1),
                                          interpolation=cv2.INTER_NEAREST)
@@ -151,7 +166,9 @@ def cover_face(frame, overlay, cx, cy, size):
     戻り値は (frame, マスク画像を使えたか)。False のときはモザイクで代用している。
     どの経路でも「何もせずに返す」ことはしない。
     """
-    cx, cy, size = int(cx), int(cy), int(size)
+    cx, cy = int(cx), int(cy)
+    # 小さすぎるサイズは下限まで広げる（1px のマスクを重ねて「適用した」ことにしない）
+    size = max(int(size), MIN_COVER_SIZE)
     # 8bit BGRA 以外（16bit・アルファなし等）は合成せずモザイクにする。
     # 環境によっては cv2 が例外を出さずに崩れた合成をするため、例外頼みにしない。
     usable = (
@@ -160,7 +177,7 @@ def cover_face(frame, overlay, cx, cy, size):
         and getattr(overlay, "ndim", 0) == 3
         and overlay.shape[2] == 4
     )
-    if usable and size > 0:
+    if usable:
         try:
             resized = cv2.resize(overlay, (size, size))
             frame = overlay_transparent(frame, resized, cx - size // 2, cy - size // 2)
@@ -168,3 +185,54 @@ def cover_face(frame, overlay, cx, cy, size):
         except Exception:
             pass
     return obscure_region(frame, cx, cy, size), False
+
+
+def decide_mask_status(mask_enabled, detector_ok, mask_usable, face_count, all_masks_applied=True):
+    """送出状態（画面に出す状態名）を決める。
+
+    - "off":             マスクOFF（素顔が映る）
+    - "detector_error":  顔検出が動いておらず、画面全体をぼかしている
+    - "no_face":         顔が見つかっていない（隠す対象がない）。マスク画像は使える
+    - "no_face_fallback": 顔が見つかっていない。マスク画像も使えない（見つかればぼかしで隠す）
+    - "ok":              見つかった顔すべてにマスク画像を重ねた
+    - "fallback":        見つかった顔のうち 1 つ以上を、マスク画像の代わりにぼかしで隠した
+
+    face_count は「いま隠している顔の数」（検出が途切れて保持中のものを含む）。
+    """
+    if not mask_enabled:
+        return "off"
+    if not detector_ok:
+        return "detector_error"
+    if face_count <= 0:
+        return "no_face" if mask_usable else "no_face_fallback"
+    return "ok" if (mask_usable and all_masks_applied) else "fallback"
+
+
+def save_mask_png(path, img):
+    """マスク画像を PNG として path に保存する。保存できたときだけ True を返す。
+
+    - 日本語パスでも書けるよう、cv2.imwrite ではなく imencode + tofile を使う。
+    - いったん一時ファイルに書き、読み戻して確認してから置き換える。
+      失敗したとき、同名の既存マスクは壊さずに残る。
+    - 例外は出さない（失敗はすべて False）。
+    """
+    tmp_path = f"{path}.tmp"
+    try:
+        ok, buf = cv2.imencode(".png", img)
+        if not ok:
+            return False
+        buf.tofile(tmp_path)
+        # 書けたつもりで壊れている（容量不足など）場合を、読み戻して検出する
+        written = cv2.imdecode(np.fromfile(tmp_path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+        if written is None or written.shape != img.shape:
+            return False
+        os.replace(tmp_path, path)
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass

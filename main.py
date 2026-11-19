@@ -15,7 +15,7 @@ from PIL import Image
 from mask_safety import (normalize_mask_image, fit_frame, obscure_frame, cover_face,
                          decide_mask_status, save_mask_png)
 from face_detector import FaceDetector, MODEL_FILENAME
-from camera_recovery import configure_capture, ReopenTimer
+from camera_recovery import configure_capture, ReopenTimer, STALLED_READ_SECONDS
 try:
     from pygrabber.dshow_graph import FilterGraph
     HAS_PYGRABBER = True
@@ -306,7 +306,10 @@ def _camera_loop():
                 loaded_mask_name = config.current_mask_name
                 overlay_img = load_mask(loaded_mask_name)
 
+            read_started = time.time()
             ret, frame = cap.read()
+            if ret and time.time() - read_started >= STALLED_READ_SECONDS:
+                ret = False  # 待たされた末の空の画像。映像は届いていない
             # カメラの実解像度が出力サイズと違っても、ここで必ず width x height に揃える
             frame = fit_frame(frame, config.width, config.height) if ret else None
             if frame is None:

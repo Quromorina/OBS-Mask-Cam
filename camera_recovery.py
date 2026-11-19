@@ -10,6 +10,10 @@ import cv2
 REOPEN_AFTER_SECONDS = 2.0
 # 開き直しても戻らないとき、次に試すまでの秒数
 REOPEN_INTERVAL_SECONDS = 3.0
+# 1 回の読み取りにこれ以上かかったら、映像が届いていないとみなす。
+# DirectShow は新しいフレームが来ないと約 1 秒待ってから、空（真っ黒）の画像を「成功」として返す
+# （USB の帯域不足の C920 で確認）。暗所で fps が落ちても 1 フレーム 0.2 秒程度なので区別できる。
+STALLED_READ_SECONDS = 0.9
 
 
 def fourcc_to_str(value):

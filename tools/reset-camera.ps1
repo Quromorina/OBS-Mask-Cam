@@ -81,10 +81,11 @@ foreach ($svc in 'FrameServerMonitor', 'FrameServer') {
     $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
     if ($s -and $s.Status -eq 'Running') {
         try {
-            Restart-Service -Name $svc -Force -ErrorAction Stop
+            Restart-Service -Name $svc -Force -ErrorAction Stop -WarningAction SilentlyContinue
             Write-Host "サービスを再起動しました: $svc"
         } catch {
-            Write-Host "サービスを再起動できませんでした: $svc ($($_.Exception.Message))"
+            # カメラを使っているアプリがあると止められない。カメラのリセットは済んでいるので続ける
+            Write-Host "サービス $svc は使用中のアプリがあるため再起動しませんでした（カメラのリセットには影響しません）"
         }
     }
 }

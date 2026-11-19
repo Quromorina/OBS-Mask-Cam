@@ -15,6 +15,8 @@ from PIL import Image
 from mask_safety import (normalize_mask_image, fit_frame, obscure_frame, cover_face,
                          decide_mask_status, save_mask_png)
 from face_detector import FaceDetector, MODEL_FILENAME
+from camera_recovery import (configure_capture, ReopenTimer, is_stalled_read, reopen_capture,
+                             close_wait_action)
 try:
     from pygrabber.dshow_graph import FilterGraph
     HAS_PYGRABBER = True
@@ -207,10 +209,9 @@ def load_mask(name):
 def open_camera(index):
     cap = cv2.VideoCapture(index, cv2.CAP_DSHOW if os.name == 'nt' else cv2.CAP_ANY)
     if cap.isOpened():
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.height)
-        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        # MJPG を要求して USB の帯域を節約する（無圧縮だと帯域不足で止まるカメラがある）
+        actual_w, actual_h, fourcc = configure_capture(cap, config.width, config.height, config.fps)
+        log.info("カメラ(Index %s)を開きました: %sx%s %s", index, actual_w, actual_h, fourcc)
         if (actual_w, actual_h) != (config.width, config.height):
             # 要求どおりの解像度にならないカメラ。毎フレーム fit_frame で出力サイズへ合わせる
             log.warning("カメラ(Index %s)の実解像度は %sx%s です。%sx%s に合わせて送出します",
@@ -243,6 +244,8 @@ def _camera_loop():
         return
     last_camera_index = config.camera_index
     cam = None
+    reopen_timer = ReopenTimer()
+    reopen_timer.on_opened(time.time())
 
     try:
         loaded_mask_name = config.current_mask_name
@@ -286,11 +289,12 @@ def _camera_loop():
                 cam.send(frame)
                 cam.sleep_until_next_frame()
                 
-                cap.release()
-                time.sleep(0.5) # リソース解放を待機
-                
                 last_camera_index = config.camera_index
-                cap = open_camera(last_camera_index)
+                new_cap = reopen_capture(cap, lambda: open_camera(last_camera_index), lambda: config.running)
+                if new_cap is None:
+                    break  # 切り替えの途中で終了が始まった（カメラは閉じてある）
+                cap = new_cap
+                reopen_timer.on_opened(time.time())
                 continue
 
             # マスクリストの更新チェック
@@ -304,7 +308,10 @@ def _camera_loop():
                 loaded_mask_name = config.current_mask_name
                 overlay_img = load_mask(loaded_mask_name)
 
+            read_started = time.time()
             ret, frame = cap.read()
+            if ret and is_stalled_read(time.time() - read_started, frame):
+                ret = False  # 待たされた末の真っ黒な画像。映像は届いていない
             # カメラの実解像度が出力サイズと違っても、ここで必ず width x height に揃える
             frame = fit_frame(frame, config.width, config.height) if ret else None
             if frame is None:
@@ -315,7 +322,26 @@ def _camera_loop():
                 config.mask_status = "no_camera"
                 cam.send(frame)
                 cam.sleep_until_next_frame()
+                # 途切れたままなら、カメラを開き直す（アプリの再起動を不要にする）
+                if reopen_timer.on_failure(time.time()) and config.running:
+                    log.warning("カメラ(Index %s)の映像が途切れたため、開き直します", last_camera_index)
+                    reopen_started = time.time()
+                    new_cap = reopen_capture(cap, lambda: open_camera(last_camera_index), lambda: config.running)
+                    reopen_seconds = time.time() - reopen_started
+                    if new_cap is None:
+                        # 開き直しの途中で終了が始まった。カメラは閉じてあるので、そのまま抜ける
+                        log.info("終了が始まったため、カメラの開き直しをやめました（%.1f 秒）", reopen_seconds)
+                        break
+                    cap = new_cap
+                    reopen_timer.on_opened(time.time())
+                    if cap.isOpened():
+                        log.info("カメラ(Index %s)を開き直しました（%.1f 秒）", last_camera_index, reopen_seconds)
+                    else:
+                        log.warning("カメラ(Index %s)を開けませんでした（%.1f 秒）。少し待って再試行します",
+                                    last_camera_index, reopen_seconds)
                 continue
+            if reopen_timer.on_success():
+                log.info("カメラの映像が戻りました")
 
             now = time.time()
             infer_wait = config.infer_interval if detector_ok else DETECTOR_RETRY_SECONDS
@@ -580,6 +606,9 @@ class ControlApp(ctk.CTk):
         self.btn_quit = ctk.CTkButton(self, text="アプリを終了", height=40, font=self.font_bold, fg_color="#9e2b2b", hover_color="#7a2222", command=self.on_closing)
         self.btn_quit.pack(pady=(20, 30))
 
+        # 終了処理が始まったら True（二重実行の防止専用。config.running とは別に持つ）
+        self._closing = False
+
         self.update_preview()
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
@@ -735,14 +764,37 @@ class ControlApp(ctk.CTk):
 
         self.after(300, self._poll_status)
 
+    # 終了時に、カメラ処理スレッドがカメラを閉じ終わるまで待つ最長秒数
+    CLOSE_WAIT_SECONDS = 5.0
+
     def on_closing(self):
+        """カメラを閉じてから終了する。閉じずに終わると、次に使うときカメラが反応しないことがある。"""
+        if self._closing:
+            return  # 終了処理中に、もう一度押された
+        self._closing = True
         config.running = False
+        self.withdraw()  # 待っているあいだ、ウィンドウは先に消す
+        self._close_deadline = time.time() + self.CLOSE_WAIT_SECONDS
+        self._wait_camera_closed()
+
+    def _wait_camera_closed(self):
+        worker = camera_worker
+        alive = worker is not None and worker.is_alive()
+        action = close_wait_action(alive, time.time(), self._close_deadline)
+        if action == "wait":
+            self.after(100, self._wait_camera_closed)
+            return
+        if action == "timed_out":
+            log.warning("カメラの終了処理が %s 秒で終わらなかったため、そのまま終了します", self.CLOSE_WAIT_SECONDS)
         self.destroy()
+
+# カメラ処理スレッド（終了時に、カメラを閉じ終わるのを待つために参照する）
+camera_worker = None
 
 if __name__ == "__main__":
     # カメラ処理を別スレッドで開始
-    thread = threading.Thread(target=camera_thread, daemon=True)
-    thread.start()
+    camera_worker = threading.Thread(target=camera_thread, daemon=True)
+    camera_worker.start()
 
     # GUIを開始
     app = ControlApp()
